@@ -87,18 +87,28 @@ final class UIOverlay {
     func tick() {
         let (dx, dy) = CGGetLastMouseDelta()
         let moved = dx != 0 || dy != 0
+        // Пока зажата правая кнопка, мышь крутит сцену: курсор панели не
+        // двигаем и панель не показываем
+        let rightHeld = NSEvent.pressedMouseButtons & 0x2 != 0
 
         if moved && NSApp.isActive {
             lastActivity = CACurrentMediaTime()
-            if active {
+            if active && !rightHeld {
                 cursorU = min(1, max(0, cursorU + Double(dx) / 900.0))
                 cursorV = min(1, max(0, cursorV + Double(dy) / 450.0))
-            } else {
+            } else if !active && !rightHeld {
                 show()
             }
         }
 
         guard active else { return }
+
+        // Пока зажата ПКМ, панель скрыта визуально, но захват мыши держим
+        // и таймер автоскрытия не тикает
+        if rightHeld {
+            lastActivity = CACurrentMediaTime()
+            return
+        }
 
         if CACurrentMediaTime() - lastActivity > 3.0 {
             hide()

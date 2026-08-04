@@ -297,8 +297,49 @@ final class HeadTracker {
         return (correction * mapped).normalized
     }
 
+    // Ручной поворот вида (перетаскивание сцены правой кнопкой).
+    // Накапливается как жёсткий поворот сцены: между перетаскиваниями сцена
+    // неподвижна (поворот головы ничего не «подплывает»), а каждый шажок
+    // применяется вокруг текущих осей взгляда — рысканье вокруг вертикали,
+    // наклон вокруг горизонтальной оси поперёк взгляда, крен не возникает.
+    // Мышь задаёт цель, кадры плавно подтягиваются slerp-доводчиком
+    private var offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var offsetCurrent = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var lastBase = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var lastSmoothTime = CACurrentMediaTime()
+
     func requestRecenter() {
         didAutoRecenter = false
+        offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        offsetCurrent = offsetTarget
+    }
+
+    func addManualRotation(dxPx: Double, dyPx: Double) {
+        let sens: Float = 0.002 // рад на пиксель (~0.11°)
+        var t = simd_quatf(angle: Float(dxPx) * sens, axis: SIMD3<Float>(0, 1, 0)) * offsetTarget
+
+        // Наклон вокруг горизонтальной оси, перпендикулярной текущему взгляду
+        let f = (t * lastBase).act(SIMD3<Float>(0, 0, -1))
+        var right = SIMD3<Float>(-f.z, 0, f.x)
+        let len = simd_length(right)
+        if len > 1e-4 {
+            right /= len
+            let tilted = simd_quatf(angle: Float(dyPx) * sens, axis: right) * t
+            let f2 = (tilted * lastBase).act(SIMD3<Float>(0, 0, -1))
+            if abs(f2.y) < 0.985 { // ограничение наклона ~±80°
+                t = tilted
+            }
+        }
+        offsetTarget = t.normalized
+    }
+
+    private func smoothManual() {
+        let now = CACurrentMediaTime()
+        let dt = Float(min(0.1, now - lastSmoothTime))
+        lastSmoothTime = now
+        // Экспоненциальный доводчик, ~90 мс до цели
+        let alpha = 1 - expf(-dt * 12)
+        offsetCurrent = simd_slerp(offsetCurrent, offsetTarget, alpha)
     }
 
     // Угловая скорость в мировой (уже отрецентренной) системе — для
@@ -320,7 +361,9 @@ final class HeadTracker {
             didAutoRecenter = true
         }
 
-        let view = recenter * q
+        smoothManual()
+        lastBase = recenter * q
+        let view = offsetCurrent * lastBase
 
         var gyro = [Float](repeating: 0, count: 3)
         var age: Double = 0
@@ -574,7 +617,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
-                (overlay?.active ?? false) ? 1 : 0,
+                // Пока зажата ПКМ (вращение сцены), панель и курсор прячем
+                (overlay?.active ?? false) && NSEvent.pressedMouseButtons & 0x2 == 0 ? 1 : 0,
                 Float(overlay?.cursorU ?? 0.5),
                 Float(overlay?.cursorV ?? 0.5)),
             p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y))
@@ -729,6 +773,13 @@ final class PlayerView: MTKView {
         print("[player] стерео: \(next.label)")
     }
 
+    override func rightMouseDragged(with event: NSEvent) {
+        guard let r = renderer else { return }
+        // «Хватаем» сцену: тянем картинку за курсором
+        r.tracker.addManualRotation(dxPx: event.deltaX, dyPx: event.deltaY)
+        r.overlay?.markActivity()
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard let r = renderer, let overlay = r.overlay else { return }
         guard overlay.active else {
@@ -866,6 +917,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // на дисплее шлема не в фокусе
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             view.keyDown(with: event)
+            return nil
+        }
+        _ = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDragged) { event in
+            view.rightMouseDragged(with: event)
             return nil
         }
 

@@ -40,7 +40,8 @@ struct Uniforms {
     float4 calibR;
     float4 p0;       // mode, stereo, fisheyeFovRad, flipV
     float4 p1;       // гироскоп в мировых осях (xyz) + длительность развёртки (w), с
-    float4 p2;       // x: хроматическая коррекция вкл/выкл
+    float4 p2;       // x: хроматика, y: панель UI видима, zw: курсор (uv текстуры панели)
+    float4 p3;       // панель в tan-пространстве: центр (xy), полуразмеры (zw)
 };
 
 constant float FX = 0.3585564;
@@ -84,7 +85,8 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
 fragment float4 fs_main(VSOut in [[stage_in]],
                         constant Uniforms &uni [[buffer(0)]],
                         device const packed_float3 *lut [[buffer(1)]],
-                        texture2d<float> video [[texture(0)]]) {
+                        texture2d<float> video [[texture(0)]],
+                        texture2d<float> ui [[texture(1)]]) {
     constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
 
     int mode = int(uni.p0.x);
@@ -160,6 +162,36 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         }
     }
 
+    // Панель управления: висит перед глазами (~1.5 м, лёгкий параллакс),
+    // координаты по зелёному каналу без флипа видео
+    if (uni.p2.y > 0.5) {
+        float aG = local_x * scale[1];
+        float bG = (local_y - 0.0002302693) * scale[1];
+        float panelTanX = k3 * aG - k4 * bG;
+        float panelTanUp = -(k4 * aG + k3 * bG);
+
+        float disp = eye == 0 ? 0.021 : -0.021;
+        float2 pc = uni.p3.xy;
+        float2 ph = uni.p3.zw;
+        float pu = (panelTanX - disp - pc.x) / (2.0 * ph.x) + 0.5;
+        float pv = (panelTanUp - pc.y) / (2.0 * ph.y) + 0.5;
+        if (pu >= 0.0 && pu <= 1.0 && pv >= 0.0 && pv <= 1.0) {
+            float2 tuv = float2(pu, 1.0 - pv);
+            float4 uiC = ui.sample(smp, tuv);
+
+            // Виртуальный курсор: белая точка с тёмной обводкой
+            float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // аспект панели 2:1
+            float dcur = length(dvec);
+            if (dcur < 0.014) {
+                uiC = float4(1.0, 1.0, 1.0, 1.0);
+            } else if (dcur < 0.020) {
+                uiC = float4(0.0, 0.0, 0.0, 1.0);
+            }
+
+            rgb = rgb * (1.0 - uiC.a) + uiC.rgb; // premultiplied alpha
+        }
+    }
+
     return float4(rgb, 1.0);
 }
 """#
@@ -175,6 +207,14 @@ enum Projection: Int32, CaseIterable {
         switch self {
         case .equirect360: return "равнопромежуточная 360°"
         case .equirect180: return "полу-эквирект 180°"
+        case .fisheye: return "fisheye"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .equirect360: return "360°"
+        case .equirect180: return "180°"
         case .fisheye: return "fisheye"
         }
     }
@@ -303,7 +343,8 @@ struct Uniforms {
     var calibR: SIMD4<Float>
     var p0: SIMD4<Float>
     var p1: SIMD4<Float> // гироскоп в мировых осях (xyz) + длительность развёртки, с
-    var p2: SIMD4<Float> // хроматическая коррекция (x)
+    var p2: SIMD4<Float> // хроматика, панель видима, курсор uv
+    var p3: SIMD4<Float> // панель: центр и полуразмеры в tan-пространстве
 }
 
 // MARK: - Видео
@@ -459,6 +500,10 @@ final class Renderer: NSObject, MTKViewDelegate {
     var calibration: [Float]
     var chromaticEnabled = true
     var scanlineEnabled = true
+    var overlay: UIOverlay!
+    // Панель UI в tan-пространстве: центр и полуразмеры (аспект 2:1 как текстура)
+    let panelCenter = SIMD2<Float>(0, -0.05)
+    let panelHalf = SIMD2<Float>(0.5, 0.25)
     // Развёртка панели: 2040/2200 строки кадра при 120 Гц (из драйвера Monado)
     let scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
 
@@ -507,6 +552,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         lastButton = button
 
+        overlay?.tick()
         video?.updateTexture()
 
         guard let drawable = view.currentDrawable,
@@ -526,12 +572,18 @@ final class Renderer: NSObject, MTKViewDelegate {
                 config.fisheyeFovDeg * .pi / 180,
                 config.flipV),
             p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
-            p2: SIMD4(chromaticEnabled ? 1 : 0, 0, 0, 0))
+            p2: SIMD4(
+                chromaticEnabled ? 1 : 0,
+                (overlay?.active ?? false) ? 1 : 0,
+                Float(overlay?.cursorU ?? 0.5),
+                Float(overlay?.cursorV ?? 0.5)),
+            p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
         enc.setFragmentTexture(video?.texture ?? placeholder, index: 0)
+        enc.setFragmentTexture(overlay?.texture ?? placeholder, index: 1)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cmd.present(drawable)
@@ -568,27 +620,19 @@ final class PlayerView: MTKView {
         switch event.keyCode {
         case 12, 53: // Q, Esc
             print("[player] выход")
+            r.overlay?.hide() // вернуть системный курсор
             r.video?.player.pause()
             psvr2_stop()
             exit(0)
         case 49: // Space
-            if let p = r.video?.player {
-                p.rate == 0 ? p.play() : p.pause()
-                print("[player] \(p.rate == 0 ? "пауза" : "воспроизведение")")
-            }
+            togglePause()
         case 15: // R
             r.tracker.requestRecenter()
             print("[player] рецентр")
         case 3: // F
-            let all = Projection.allCases
-            let next = all[(all.firstIndex(of: r.config.projection)! + 1) % all.count]
-            r.config.projection = next
-            print("[player] проекция: \(next.label)")
+            cycleProjection()
         case 5: // G
-            let all = StereoLayout.allCases
-            let next = all[(all.firstIndex(of: r.config.stereo)! + 1) % all.count]
-            r.config.stereo = next
-            print("[player] стерео: \(next.label)")
+            cycleStereo()
         case 9: // V
             r.config.flipV *= -1
             print("[player] вертикальный флип: \(r.config.flipV < 0 ? "вкл" : "выкл")")
@@ -662,6 +706,58 @@ final class PlayerView: MTKView {
         let target = CMTimeAdd(p.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
         p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
     }
+
+    private func togglePause() {
+        guard let p = renderer?.video?.player else { return }
+        p.rate == 0 ? p.play() : p.pause()
+        print("[player] \(p.rate == 0 ? "пауза" : "воспроизведение")")
+    }
+
+    private func cycleProjection() {
+        guard let r = renderer else { return }
+        let all = Projection.allCases
+        let next = all[(all.firstIndex(of: r.config.projection)! + 1) % all.count]
+        r.config.projection = next
+        print("[player] проекция: \(next.label)")
+    }
+
+    private func cycleStereo() {
+        guard let r = renderer else { return }
+        let all = StereoLayout.allCases
+        let next = all[(all.firstIndex(of: r.config.stereo)! + 1) % all.count]
+        r.config.stereo = next
+        print("[player] стерео: \(next.label)")
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let r = renderer, let overlay = r.overlay else { return }
+        guard overlay.active else {
+            overlay.markActivity()
+            return
+        }
+        if let action = overlay.click() {
+            perform(uiAction: action)
+            overlay.redrawSoon()
+        }
+    }
+
+    func perform(uiAction: UIAction) {
+        guard let r = renderer else { return }
+        switch uiAction {
+        case .playPause: togglePause()
+        case .seekBack: seek(by: -15)
+        case .seekFwd: seek(by: 15)
+        case .seekBack30: seek(by: -30)
+        case .seekFwd30: seek(by: 30)
+        case .volDown: changeVolume(by: -0.1)
+        case .volUp: changeVolume(by: 0.1)
+        case .recenter:
+            r.tracker.requestRecenter()
+            print("[player] рецентр")
+        case .cycleProjection: cycleProjection()
+        case .cycleStereo: cycleStereo()
+        }
+    }
 }
 
 // Безрамочное окно по умолчанию не принимает клавиатуру — разрешаем явно
@@ -720,6 +816,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         renderer = try! Renderer(device: device, config: config, calibration: calibration)
+
+        // Панель управления в шлеме (появляется при движении мыши)
+        let overlay = UIOverlay(device: device)
+        overlay.renderer = renderer
+        overlay.captureEnabled = vrScreen != nil
+        let primaryHeight = NSScreen.screens[0].frame.height
+        overlay.warpPoint = CGPoint(x: screen.frame.midX, y: primaryHeight - screen.frame.midY)
+        renderer.overlay = overlay
 
         if let url = videoURL {
             let vs = VideoSource(url: url, device: device)
@@ -797,6 +901,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        renderer?.overlay?.hide()
         if let link = cvLink {
             CVDisplayLinkStop(link)
         }

@@ -232,6 +232,14 @@ enum StereoLayout: Int32, CaseIterable {
         case .tb: return "стерео верх/низ"
         }
     }
+
+    var shortLabel: String {
+        switch self {
+        case .mono: return "моно"
+        case .sbs: return "SBS"
+        case .tb: return "TB"
+        }
+    }
 }
 
 struct PlaybackConfig {
@@ -583,8 +591,42 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private var lastButton = false
+    // Автопауза по датчику приближения (шлем снят/надет), с дебаунсом
+    private var wornState = true
+    private var lastProxRaw = true
+    private var proxRawSince = CACurrentMediaTime()
+    private var autoPaused = false
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    private func updateProximity() {
+        var prox: Int32 = 0
+        var ipd: Int32 = 0
+        psvr2_get_status(&prox, &ipd)
+        let raw = prox == 1
+
+        let now = CACurrentMediaTime()
+        if raw != lastProxRaw {
+            lastProxRaw = raw
+            proxRawSince = now
+        }
+        // Состояние принимается после 0.4 с стабильности
+        guard raw != wornState, now - proxRawSince > 0.4 else { return }
+        wornState = raw
+
+        guard let player = video?.player else { return }
+        if !wornState {
+            if player.rate != 0 {
+                player.pause()
+                autoPaused = true
+                print("[player] шлем снят — пауза")
+            }
+        } else if autoPaused {
+            player.play()
+            autoPaused = false
+            print("[player] шлем надет — продолжаем")
+        }
+    }
 
     func draw(in view: MTKView) {
         // Кнопка Fn на шлеме — рецентр (по фронту нажатия)
@@ -594,6 +636,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             print("[player] рецентр (кнопка шлема)")
         }
         lastButton = button
+
+        updateProximity()
 
         overlay?.tick()
         video?.updateTexture()
@@ -780,6 +824,14 @@ final class PlayerView: MTKView {
         r.overlay?.markActivity()
     }
 
+    override func scrollWheel(with event: NSEvent) {
+        // Прокрутка списка файлов колесом
+        let dy = event.scrollingDeltaY
+        if abs(dy) > 1 {
+            renderer?.overlay?.scrollPicker(rows: dy > 0 ? -1 : 1)
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
         guard let r = renderer, let overlay = r.overlay else { return }
         guard overlay.active else {
@@ -874,15 +926,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.captureEnabled = vrScreen != nil
         let primaryHeight = NSScreen.screens[0].frame.height
         overlay.warpPoint = CGPoint(x: screen.frame.midX, y: primaryHeight - screen.frame.midY)
+        overlay.onOpenFile = { [weak self] url in
+            self?.loadVideo(url)
+        }
         renderer.overlay = overlay
 
         if let url = videoURL {
-            let vs = VideoSource(url: url, device: device)
-            vs.routeAudioToHeadset()
-            renderer.video = vs
-            print("[player] Файл: \(url.lastPathComponent)")
-            print("[player] Проекция: \(config.projection.label), \(config.stereo.label)"
-                + (config.projection == .fisheye ? ", FOV \(config.fisheyeFovDeg)°" : ""))
+            loadVideo(url)
         }
 
         let view = PlayerView(frame: screen.frame, device: device)
@@ -949,10 +999,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.isPaused = false
         }
 
-        renderer.video?.player.play()
+        // Без файла — сразу открываем выбор в шлеме
+        if videoURL == nil {
+            overlay.openPicker()
+        }
+
         print("[player] Управление: Space пауза · R или кнопка Fn шлема — рецентр · F проекция · G стерео · V флип")
         print("[player]             ←/→ ±15с · ↑/↓ громкость · +/- FOV fisheye · Q выход")
         print("[player]             отладка: P предсказание · [/] упреждение · S развёртка · C хроматика")
+    }
+
+    func loadVideo(_ url: URL) {
+        guard let renderer else { return }
+        let vs = VideoSource(url: url, device: renderer.device)
+        vs.routeAudioToHeadset()
+        renderer.video = vs
+        renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
+        vs.player.play()
+        let config = renderer.config
+        print("[player] Файл: \(url.lastPathComponent)")
+        print("[player] Проекция: \(config.projection.label), \(config.stereo.label)"
+            + (config.projection == .fisheye ? ", FOV \(config.fisheyeFovDeg)°" : ""))
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -970,17 +1037,8 @@ setbuf(stdout, nil)
 setbuf(stderr, nil)
 
 let args = CommandLine.arguments
-var url: URL?
-if args.count > 1 {
-    url = URL(fileURLWithPath: args[1])
-} else {
-    let panel = NSOpenPanel()
-    panel.title = "Выберите 180/360 видео"
-    panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
-    if panel.runModal() == .OK {
-        url = panel.url
-    }
-}
+// Без аргумента файл выбирается панелью в шлеме после запуска
+let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
 
 let app = NSApplication.shared
 app.setActivationPolicy(.regular)

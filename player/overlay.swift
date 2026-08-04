@@ -69,6 +69,23 @@ final class UIOverlay {
     private var savedMousePos: CGPoint?
     private var lastHovered: Int = -1
 
+    // Всплывающий индикатор (например, громкость): показывается и без панели
+    private var osdText: String?
+    private var osdUntil = 0.0
+    private var osdDirty = false
+
+    private var osdActive: Bool { osdUntil > CACurrentMediaTime() }
+
+    // Что показывать в шейдере: панель и/или плашку OSD
+    var displayVisible: Bool { active || osdActive }
+
+    func showOSD(_ text: String) {
+        osdText = text
+        osdUntil = CACurrentMediaTime() + 1.5
+        osdDirty = true
+        redrawSoon()
+    }
+
     init(device: MTLDevice) {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: Self.texW, height: Self.texH, mipmapped: false)
@@ -224,7 +241,14 @@ final class UIOverlay {
             }
         }
 
-        guard active else { return }
+        guard active else {
+            // Панель скрыта, но плашка OSD могла обновиться — перерисуем текстуру
+            if osdDirty {
+                osdDirty = false
+                redraw()
+            }
+            return
+        }
 
         // Свернули приложение — освобождаем мышь
         if !NSApp.isActive {
@@ -363,13 +387,21 @@ final class UIOverlay {
 
         ctx.clear(CGRect(x: 0, y: 0, width: Self.texW, height: Self.texH))
 
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+
+        // Панель скрыта: рисуем только плашку OSD на прозрачном фоне
+        if !active {
+            drawOSDIfNeeded(ctx)
+            NSGraphicsContext.restoreGraphicsState()
+            upload(ctx)
+            return
+        }
+
         let bgRect = CGRect(x: 4, y: 4, width: Self.texW - 8, height: Self.texH - 8)
         ctx.addPath(CGPath(roundedRect: bgRect, cornerWidth: 28, cornerHeight: 28, transform: nil))
         ctx.setFillColor(CGColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 0.85))
         ctx.fillPath()
-
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
 
         for (i, b) in buttons.enumerated() {
             let hovered = i == lastHovered
@@ -399,8 +431,23 @@ final class UIOverlay {
             drawText(shown, in: topRect, size: 26, color: NSColor(white: 0.75, alpha: 1))
         }
 
-        NSGraphicsContext.restoreGraphicsState()
+        drawOSDIfNeeded(ctx)
 
+        NSGraphicsContext.restoreGraphicsState()
+        upload(ctx)
+    }
+
+    private func drawOSDIfNeeded(_ ctx: CGContext) {
+        guard osdActive, let text = osdText else { return }
+        let w = 440.0, h = 72.0
+        let rect = CGRect(x: (Double(Self.texW) - w) / 2, y: Double(Self.texH) - h - 14, width: w, height: h)
+        ctx.addPath(CGPath(roundedRect: rect, cornerWidth: 20, cornerHeight: 20, transform: nil))
+        ctx.setFillColor(CGColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 0.9))
+        ctx.fillPath()
+        drawText(text, in: rect, size: 34, color: .white)
+    }
+
+    private func upload(_ ctx: CGContext) {
         if let data = ctx.data {
             texture.replace(
                 region: MTLRegionMake2D(0, 0, Self.texW, Self.texH), mipmapLevel: 0,

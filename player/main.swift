@@ -406,6 +406,7 @@ final class VideoSource {
     private var textureCache: CVMetalTextureCache?
     private(set) var texture: MTLTexture?
     private(set) var audioDeviceID: AudioDeviceID?
+    private var endObserver: NSObjectProtocol?
 
     init(url: URL, device: MTLDevice) {
         let item = AVPlayerItem(url: url)
@@ -416,14 +417,31 @@ final class VideoSource {
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
         item.add(output)
         player = AVPlayer(playerItem: item)
-        player.actionAtItemEnd = .none
+        player.actionAtItemEnd = .pause
         CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
 
-        NotificationCenter.default.addObserver(
+        // В конце файла — стоп и перемотка в начало (без повтора);
+        // «Играть» запустит с начала
+        endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
-            self?.player.seek(to: .zero)
+            self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
+            print("[player] конец файла")
         }
+    }
+
+    // Явная остановка при замене файла
+    func stop() {
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        if let endObserver {
+            NotificationCenter.default.removeObserver(endObserver)
+            self.endObserver = nil
+        }
+    }
+
+    deinit {
+        stop()
     }
 
     func routeAudioToHeadset() {
@@ -662,9 +680,10 @@ final class Renderer: NSObject, MTKViewDelegate {
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
                 // Пока зажата ПКМ (вращение сцены), панель и курсор прячем
-                (overlay?.active ?? false) && NSEvent.pressedMouseButtons & 0x2 == 0 ? 1 : 0,
-                Float(overlay?.cursorU ?? 0.5),
-                Float(overlay?.cursorV ?? 0.5)),
+                (overlay?.displayVisible ?? false) && NSEvent.pressedMouseButtons & 0x2 == 0 ? 1 : 0,
+                // Курсор показываем только с панелью (не с одной плашкой OSD)
+                Float((overlay?.active ?? false) ? overlay!.cursorU : -10),
+                Float((overlay?.active ?? false) ? overlay!.cursorV : -10)),
             p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y))
 
         enc.setRenderPipelineState(pipeline)
@@ -729,9 +748,9 @@ final class PlayerView: MTKView {
         case 124: // →
             seek(by: 15)
         case 126: // ↑
-            changeVolume(by: 0.1)
+            changeVolume(by: 0.05)
         case 125: // ↓
-            changeVolume(by: -0.1)
+            changeVolume(by: -0.05)
         case 35: // P
             r.tracker.predictionEnabled.toggle()
             print("[player] предсказание позы: \(r.tracker.predictionEnabled ? "вкл" : "выкл")")
@@ -786,7 +805,10 @@ final class PlayerView: MTKView {
 
         let p = video.player
         p.volume = max(0, min(1, p.volume + delta))
-        print("[player] громкость плеера: \(Int(p.volume * 100))%")
+        let percent = Int((p.volume * 100).rounded())
+        UserDefaults.standard.set(p.volume, forKey: "volume")
+        renderer?.overlay?.showOSD("Громкость \(percent)%")
+        print("[player] громкость плеера: \(percent)%")
     }
 
     private func seek(by seconds: Double) {
@@ -852,8 +874,8 @@ final class PlayerView: MTKView {
         case .seekFwd: seek(by: 15)
         case .seekBack30: seek(by: -30)
         case .seekFwd30: seek(by: 30)
-        case .volDown: changeVolume(by: -0.1)
-        case .volUp: changeVolume(by: 0.1)
+        case .volDown: changeVolume(by: -0.05)
+        case .volUp: changeVolume(by: 0.05)
         case .recenter:
             r.tracker.requestRecenter()
             print("[player] рецентр")
@@ -1011,8 +1033,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func loadVideo(_ url: URL) {
         guard let renderer else { return }
+        renderer.video?.stop()
         let vs = VideoSource(url: url, device: renderer.device)
         vs.routeAudioToHeadset()
+        // Восстанавливаем сохранённую громкость
+        if let saved = UserDefaults.standard.object(forKey: "volume") as? Float {
+            vs.player.volume = max(0, min(1, saved))
+        }
         renderer.video = vs
         renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
         vs.player.play()

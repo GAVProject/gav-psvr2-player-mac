@@ -1,0 +1,16 @@
+# Сборка
+*.o
+player/psvr2player
+tools/psvr2_probe
+
+# Артефакты запуска
+psvr2_calibration.bin
+tools/psvr2_calibration.bin
+
+# Видеофайлы
+video/
+*.mp4
+*.mov
+*.mkv
+
+.DS_Store

@@ -472,7 +472,7 @@ final class VideoSource {
     private(set) var isBGRA = false
     private(set) var audioDeviceID: AudioDeviceID?
     private var endObserver: NSObjectProtocol?
-    private let url: URL
+    let url: URL
     var onUnsupported: ((String) -> Void)?
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
@@ -1281,6 +1281,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Окно-пульт на обычном мониторе: держит клавиатурный фокус, чтобы
     // системные диалоги открывались на видимом экране, а не в шлеме
     var controlWindow: NSWindow?
+    // Поля значений в таблице пульта, по идентификатору строки
+    var controlValues: [String: NSTextField] = [:]
+    var statusTimer: Timer?
     var sweeper: WindowSweeper?
     let videoURL: URL?
 
@@ -1428,13 +1431,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         print("[player]             отладка: P предсказание · [/] упреждение · S развёртка · C хроматика")
     }
 
-    // Окно-пульт на обычном мониторе. Держит клавиатурный фокус приложения,
-    // чтобы системные диалоги открывались на видимом экране, а не в шлеме
+    // Окно-пульт на обычном мониторе: таблица «настройка — значение —
+    // клавиша» по группам, как в типичных настройках приложения. Заодно
+    // держит клавиатурный фокус, чтобы системные диалоги были видны
     private func makeControlWindow() {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 480, height: 150)
+        let size = NSSize(width: 620, height: 512)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -1445,24 +1449,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered, defer: false, screen: deskScreen)
         win.title = "PSVR2 Player — пульт"
         win.isReleasedWhenClosed = false
+        let content = win.contentView!
 
-        let label = NSTextField(wrappingLabelWithString:
-            "Плеер выводит в шлем; системные диалоги открываются здесь.\n"
-            + "Space пауза · ←/→ перемотка · ↑/↓ громкость · Q выход")
-        label.frame = NSRect(x: 16, y: 66, width: size.width - 32, height: size.height - 82)
-        label.font = .systemFont(ofSize: 12)
-        win.contentView?.addSubview(label)
+        func label(_ s: String, size: CGFloat = 12.5, color: NSColor = .labelColor,
+                   weight: NSFont.Weight = .regular, mono: Bool = false) -> NSTextField {
+            let l = NSTextField(labelWithString: s)
+            l.font = mono
+                ? .monospacedDigitSystemFont(ofSize: size, weight: weight)
+                : .systemFont(ofSize: size, weight: weight)
+            l.textColor = color
+            return l
+        }
+
+        let grid = NSGridView()
+        grid.rowSpacing = 5
+        grid.columnSpacing = 16
+        controlValues.removeAll()
+
+        func addHeader(_ title: String) {
+            // Строка обязана иметь все 3 ячейки, иначе mergeCells падает
+            let row = grid.addRow(with: [
+                label(title, size: 12, color: .secondaryLabelColor, weight: .semibold),
+                NSGridCell.emptyContentView,
+                NSGridCell.emptyContentView,
+            ])
+            row.mergeCells(in: NSRange(location: 0, length: 3))
+            row.topPadding = grid.numberOfRows > 1 ? 14 : 0
+        }
+        func addRow(_ name: String, id: String, key: String) {
+            let value = label("—", mono: true)
+            value.lineBreakMode = .byTruncatingMiddle
+            grid.addRow(with: [
+                label(name, color: .secondaryLabelColor),
+                value,
+                label(key, size: 11.5, color: .tertiaryLabelColor, mono: true),
+            ])
+            controlValues[id] = value
+        }
+
+        addHeader("Воспроизведение")
+        addRow("Файл", id: "file", key: "")
+        addRow("Позиция", id: "pos", key: "Space · ←/→")
+        addRow("Громкость", id: "vol", key: "↑/↓")
+        addRow("Скорость", id: "rate", key: "панель в шлеме")
+        addHeader("Изображение")
+        addRow("Проекция", id: "proj", key: "F")
+        addRow("Стерео", id: "stereo", key: "G")
+        addRow("Флип по вертикали", id: "flip", key: "V")
+        addRow("FOV fisheye", id: "fov", key: "+ / −")
+        addHeader("Шлем и трекинг")
+        addRow("Трекинг", id: "track", key: "")
+        addRow("Предсказание позы", id: "pred", key: "P")
+        addRow("Упреждение", id: "look", key: "[ / ]")
+        addRow("Коррекция развёртки", id: "scan", key: "S")
+        addRow("Хроматика", id: "chrom", key: "C")
+        addRow("Vsync", id: "vsync", key: "D")
+
+        grid.column(at: 0).width = 150
+        grid.column(at: 1).width = 270
+        grid.column(at: 2).xPlacement = .trailing
+
+        let footer = NSTextField(wrappingLabelWithString:
+            "Рецентр: R или кнопка Fn · долгое Fn — центр видео по взгляду · Q — выход\n"
+            + "Мышь в шлеме: движение — панель · ПКМ — наклон сцены · колесо — список")
+        footer.font = .systemFont(ofSize: 11.5)
+        footer.textColor = .tertiaryLabelColor
 
         let openBtn = NSButton(title: "Открыть видео…", target: self,
                                action: #selector(openVideoFromMonitor))
         openBtn.bezelStyle = .rounded
         openBtn.controlSize = .large
         openBtn.font = .systemFont(ofSize: 15, weight: .semibold)
-        openBtn.frame = NSRect(x: 16, y: 14, width: 214, height: 44)
-        win.contentView?.addSubview(openBtn)
+
+        for v in [grid, footer, openBtn] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            grid.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -20),
+            footer.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 14),
+            footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
+            openBtn.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            openBtn.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
+        ])
 
         win.makeKeyAndOrderFront(nil)
         controlWindow = win
+
+        updateControlStatus()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateControlStatus()
+        }
+    }
+
+    private static func timeText(_ seconds: Double) -> String {
+        guard seconds.isFinite else { return "--:--" }
+        let s = Int(seconds.rounded())
+        return s >= 3600
+            ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+            : String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    // Текущие значения всех настроек — раз в секунду в пульт
+    private func updateControlStatus() {
+        guard let r = renderer, !controlValues.isEmpty else { return }
+        func set(_ id: String, _ text: String) {
+            controlValues[id]?.stringValue = text
+        }
+
+        if let v = r.video {
+            set("file", v.url.lastPathComponent)
+            var pos = "--:--", dur = "--:--"
+            if let item = v.player.currentItem, item.duration.isNumeric {
+                pos = Self.timeText(v.player.currentTime().seconds)
+                dur = Self.timeText(item.duration.seconds)
+            }
+            set("pos", "\(pos) / \(dur) · \(v.player.rate == 0 ? "пауза" : "играет")")
+            set("vol", v.deviceVolume().map { "\(Int($0 * 100))% (шлем)" }
+                ?? "\(Int(v.player.volume * 100))%")
+        } else {
+            set("file", "не открыт")
+            set("pos", "—")
+            set("vol", "—")
+        }
+        set("rate", String(format: "%g×", r.playbackRate))
+
+        let cfg = r.config
+        set("proj", cfg.projection.label)
+        set("stereo", cfg.stereo.label)
+        set("flip", cfg.flipV < 0 ? "вкл" : "выкл")
+        set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
+
+        set("track", r.tracker.connected ? "есть" : "НЕТ")
+        set("pred", r.tracker.predictionEnabled ? "вкл" : "выкл")
+        set("look", "\(Int(r.tracker.extraLookaheadS * 1000)) мс")
+        set("scan", r.scanlineEnabled ? "вкл" : "выкл")
+        set("chrom", r.chromaticEnabled ? "вкл" : "выкл")
+        set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)
+            ? "вкл" : "выкл")
     }
 
     // Выбор видео стандартным диалогом на мониторе

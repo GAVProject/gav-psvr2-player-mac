@@ -1335,11 +1335,21 @@ final class PlayerView: MTKView {
         r.overlay?.markActivity()
     }
 
+    private var scrollAccum = 0.0
+
     override func scrollWheel(with event: NSEvent) {
-        // Прокрутка списка файлов колесом
-        let dy = event.scrollingDeltaY
-        if abs(dy) > 1 {
-            renderer?.overlay?.scrollPicker(rows: dy > 0 ? -1 : 1)
+        // Прокрутка списка файлов. Тачпад шлёт поток мелких дельт и добавляет
+        // инерционный «выбег» после отрыва пальцев — от него список улетал бы
+        // на десятки строк, поэтому фазу инерции пропускаем, а дельты
+        // накапливаем до целой строки
+        if event.momentumPhase != [] {
+            return
+        }
+        // У тачпада дельты «точные» и в разы мельче щелчка колеса
+        scrollAccum += event.scrollingDeltaY / (event.hasPreciseScrollingDeltas ? 28 : 1)
+        while abs(scrollAccum) >= 1 {
+            renderer?.overlay?.scrollPicker(rows: scrollAccum > 0 ? -1 : 1)
+            scrollAccum -= scrollAccum > 0 ? 1 : -1
         }
     }
 

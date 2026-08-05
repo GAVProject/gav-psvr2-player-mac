@@ -1557,7 +1557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 512)
+        let size = NSSize(width: 620, height: 610)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -1616,6 +1616,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addRow("Стерео", id: "stereo", key: "G")
         addRow("Флип по вертикали", id: "flip", key: "V")
         addRow("FOV fisheye", id: "fov", key: "+ / −")
+        addHeader("Камеры (вид вокруг)")
+        addRow("Режим", id: "pt", key: "B · двойное Fn")
+        addRow("Стерео/моно", id: "ptmode", key: "M")
+        addRow("Сведение", id: "ptconv", key: ", / .")
+        addRow("Угол объектива", id: "ptfov", key: "+ / −")
         addHeader("Шлем и трекинг")
         addRow("Трекинг", id: "track", key: "")
         addRow("Предсказание позы", id: "pred", key: "P")
@@ -1629,8 +1634,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grid.column(at: 2).xPlacement = .trailing
 
         let footer = NSTextField(wrappingLabelWithString:
-            "Рецентр: R или кнопка Fn · долгое Fn — центр видео по взгляду · Q — выход\n"
-            + "Мышь в шлеме: движение — панель · ПКМ — наклон сцены · колесо — список")
+            "Кнопка Fn: одиночное — рецентр · двойное — вид с камер · долгое — центр по взгляду\n"
+            + "R — рецентр · Q — выход · мышь в шлеме: движение — панель, ПКМ — наклон, колесо — список")
         footer.font = .systemFont(ofSize: 11.5)
         footer.textColor = .tertiaryLabelColor
 
@@ -1701,6 +1706,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("stereo", cfg.stereo.label)
         set("flip", cfg.flipV < 0 ? "вкл" : "выкл")
         set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
+
+        if let pt = r.passthrough {
+            set("pt", pt.active ? "включены" : (pt.available ? "выключены" : "недоступны"))
+            set("ptmode", pt.source.label)
+            set("ptconv", String(format: "%+.3f", pt.convergence))
+            set("ptfov", "\(Int(pt.fovDeg))°")
+        }
 
         set("track", r.tracker.connected ? "есть" : "НЕТ")
         set("pred", r.tracker.predictionEnabled ? "вкл" : "выкл")

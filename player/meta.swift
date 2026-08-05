@@ -1,8 +1,8 @@
-// Метаданные видеофайлов для списка выбора: миниатюра, длительность,
-// разрешение. Загружаются в фоне по одному файлу за раз (8K HEVC-кадр
-// декодируется заметное время), результат кэшируется на сессию.
+// Video file metadata for the picker list: thumbnail, duration, resolution.
+// Loaded in the background one file at a time (an 8K HEVC frame takes a
+// noticeable time to decode); results are cached for the session.
 //
-// ResumeStore — запоминание позиции просмотра per-файл (UserDefaults).
+// ResumeStore — per-file playback position memory (UserDefaults).
 
 import AVFoundation
 
@@ -21,7 +21,7 @@ final class VideoMetaCache {
 
     func meta(for url: URL) -> Meta? { cache[url.path] }
 
-    // Поставить файл в очередь загрузки (повторные вызовы игнорируются)
+    // Queue a file for loading (repeated calls are ignored)
     func request(_ url: URL) {
         let key = url.path
         guard cache[key] == nil, !queued.contains(key) else { return }
@@ -30,9 +30,9 @@ final class VideoMetaCache {
         pump()
     }
 
-    // Сбросить очередь (список закрыт/сменилась папка): декодирование миниатюр
-    // не должно конкурировать с воспроизведением. Видимые строки при следующей
-    // отрисовке встанут в очередь заново
+    // Drop the queue (list closed / folder changed): thumbnail decoding must
+    // not compete with playback. Visible rows will be queued again on the
+    // next redraw
     func cancelPending() {
         for url in queue {
             queued.remove(url.path)
@@ -61,7 +61,7 @@ final class VideoMetaCache {
             let t = CMTime(seconds: min(20, (duration ?? 20) * 0.15), preferredTimescale: 600)
             var thumb = try? await gen.image(at: t).image
 
-            // У SBS-видео (аспект ≥ 1.9) берём только левый глаз
+            // For SBS video (aspect ≥ 1.9) take only the left eye
             if let th = thumb, let d = dims, d.height > 0, d.width / d.height > 1.9 {
                 thumb = th.cropping(
                     to: CGRect(x: 0, y: 0, width: th.width / 2, height: th.height)) ?? th
@@ -79,13 +79,13 @@ final class VideoMetaCache {
     }
 }
 
-// MARK: - Память позиции просмотра
+// MARK: - Playback position memory
 
 enum ResumeStore {
     private static let key = "resumePositions"
 
-    // Кэш в памяти: position() зовётся из отрисовки списка на каждый кадр,
-    // читать plist из UserDefaults каждый раз накладно
+    // In-memory cache: position() is called from list drawing every frame,
+    // and reading the plist from UserDefaults each time is costly
     private static var cache: [String: Double] =
         (UserDefaults.standard.dictionary(forKey: key) as? [String: Double]) ?? [:]
 
@@ -93,7 +93,7 @@ enum ResumeStore {
         cache[url.path]
     }
 
-    // nil — удалить запись (файл досмотрен)
+    // nil — remove the entry (file watched to the end)
     static func set(_ pos: Double?, for url: URL) {
         cache[url.path] = pos
         UserDefaults.standard.set(cache, forKey: key)

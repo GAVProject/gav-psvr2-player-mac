@@ -1,17 +1,18 @@
-// Сторож окон на дисплее шлема: чужие окна и диалоги, открывшиеся на нём,
-// пользователю не видны — сторож раз в 2 с находит их и переносит на монитор
-// (нужно разрешение «Универсальный доступ»), либо предупреждает плашкой.
+// Watchdog for windows on the headset display: other apps' windows and dialogs
+// that open there are invisible to the user — every 2 s the sweeper finds them
+// and moves them to the monitor (requires the Accessibility permission), or
+// warns with an OSD plate.
 
 import AppKit
 import ApplicationServices
 
 final class WindowSweeper {
-    private let vrFrame: CGRect     // CG-координаты: y вниз от верха главного экрана
-    private let targetFrame: CGRect // куда переносить (обычный монитор)
+    private let vrFrame: CGRect     // CG coordinates: y down from the top of the main screen
+    private let targetFrame: CGRect // where to move windows (the regular monitor)
     private var timer: Timer?
-    // Чтобы не сыпать плашками каждые 2 с об одном и том же окне
+    // Avoid spamming plates every 2 s about the same window
     private var reported: [String: Double] = [:]
-    // имя приложения, удалось ли перенести
+    // app name, whether the move succeeded
     var onStray: ((String, Bool) -> Void)?
 
     init(vrFrame: CGRect, targetFrame: CGRect) {
@@ -34,7 +35,7 @@ final class WindowSweeper {
         for info in list {
             guard let pid = info[kCGWindowOwnerPID as String] as? pid_t,
                   pid != myPID,
-                  // Обычные окна и диалоги; строка меню, Dock и оверлеи — выше
+                  // Regular windows and dialogs; the menu bar, Dock and overlays are higher
                   let layer = info[kCGWindowLayer as String] as? Int, layer >= 0, layer <= 8,
                   let b = info[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
             let rect = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0,
@@ -54,7 +55,7 @@ final class WindowSweeper {
         }
     }
 
-    // Найти AX-окно процесса по совпадению позиции и передвинуть на монитор
+    // Find the process's AX window by matching position and move it to the monitor
     private func move(pid: pid_t, rect: CGRect) -> Bool {
         let app = AXUIElementCreateApplication(pid)
         var value: CFTypeRef?

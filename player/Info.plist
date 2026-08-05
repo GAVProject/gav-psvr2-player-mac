@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>PSVR2 Player</string>
+	<string>GAV PSVR2 Player</string>
 	<key>CFBundleDisplayName</key>
-	<string>PSVR2 Player</string>
+	<string>GAV PSVR2 Player</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.psvr2player</string>
 	<key>CFBundleExecutable</key>
@@ -21,17 +21,17 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 
-	<!-- Без этих строк macOS не может показать запрос доступа
-	     и обращение к тому просто зависает -->
+	<!-- Without these strings macOS cannot show the access prompt
+	     and accessing the volume simply hangs -->
 	<key>NSRemovableVolumesUsageDescription</key>
-	<string>Для воспроизведения видео с внешних дисков.</string>
+	<string>To play videos from external disks.</string>
 	<key>NSNetworkVolumesUsageDescription</key>
-	<string>Для воспроизведения видео с сетевых дисков.</string>
+	<string>To play videos from network drives.</string>
 	<key>NSDesktopFolderUsageDescription</key>
-	<string>Для доступа к видео на рабочем столе.</string>
+	<string>To access videos on the Desktop.</string>
 	<key>NSDocumentsFolderUsageDescription</key>
-	<string>Для доступа к видео в папке «Документы».</string>
+	<string>To access videos in the Documents folder.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
-	<string>Для доступа к видео в папке «Загрузки».</string>
+	<string>To access videos in the Downloads folder.</string>
 </dict>
 </plist>

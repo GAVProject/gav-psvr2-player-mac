@@ -1,13 +1,13 @@
 /*
- * psvr2_probe — проверка доступа к PSVR2 по USB на macOS.
+ * psvr2_probe — check USB access to the PSVR2 on macOS.
  *
- * Открывает шлем (Sony 0x054C:0x0CDE) через libusb, читает:
- *  - информацию о прошивке (control-запрос 0x81)
- *  - калибровку дисторсии линз (control-запрос 0x8f)
- *  - статус: датчик приближения, кнопка Fn, IPD, IMU (interrupt EP 0x88)
- *  - SLAM-позу: позиция + кватернион с борта шлема (bulk EP 0x83)
+ * Opens the headset (Sony 0x054C:0x0CDE) via libusb and reads:
+ *  - firmware information (control request 0x81)
+ *  - lens distortion calibration (control request 0x8f)
+ *  - status: proximity sensor, Fn button, IPD, IMU (interrupt EP 0x88)
+ *  - SLAM pose: position + quaternion computed on the headset (bulk EP 0x83)
  *
- * Протокол задокументирован в драйвере Monado (BSL-1.0):
+ * Protocol documented in the Monado driver (BSL-1.0):
  * https://gitlab.freedesktop.org/monado/monado, src/xrt/drivers/psvr2
  */
 #include <stdio.h>
@@ -54,7 +54,7 @@ struct slam_usb_record {
 	uint32_t vts_ts_us;
 	uint32_t unknown1;
 	float pos[3];
-	float orient[4]; /* w, x, y, z в порядке из Monado: orient[0]=w */
+	float orient[4]; /* w, x, y, z in Monado order: orient[0]=w */
 	uint8_t remainder[468];
 };
 
@@ -113,11 +113,11 @@ int main(void)
 
 	libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
 	if (dev == NULL) {
-		fprintf(stderr, "Не удалось открыть PSVR2 (%04x:%04x). Подключён ли USB адаптера?\n",
+		fprintf(stderr, "Failed to open PSVR2 (%04x:%04x). Is the adapter's USB plugged in?\n",
 		        PSVR2_VID, PSVR2_PID);
 		return 1;
 	}
-	printf("[ok] Устройство PSVR2 открыто\n");
+	printf("[ok] PSVR2 device opened\n");
 
 	ret = libusb_claim_interface(dev, STATUS_INTERFACE);
 	if (ret < 0) {
@@ -129,25 +129,25 @@ int main(void)
 		fprintf(stderr, "status alt setting: %s\n", libusb_error_name(ret));
 		return 1;
 	}
-	printf("[ok] Интерфейс статуса (7, alt 1) захвачен\n");
+	printf("[ok] Status interface (7, alt 1) claimed\n");
 
 	ret = libusb_claim_interface(dev, SLAM_INTERFACE);
 	if (ret < 0) {
 		fprintf(stderr, "claim SLAM interface: %s\n", libusb_error_name(ret));
 		return 1;
 	}
-	printf("[ok] Интерфейс SLAM (3) захвачен\n");
+	printf("[ok] SLAM interface (3) claimed\n");
 
 	struct pkt_firmware_info fw;
 	if (get_control(dev, 0x81, 0x1, (uint8_t *)&fw, sizeof(fw)) == 0) {
-		printf("[ok] Прошивка: %08x, PCB: %.16s\n", fw.version, fw.pcb_id);
+		printf("[ok] Firmware: %08x, PCB: %.16s\n", fw.version, fw.pcb_id);
 	}
 
 	uint8_t calib[0x100];
 	if (get_control(dev, 0x8f, 0x1, calib, sizeof(calib)) == 0) {
 		float params[8];
 		memcpy(params, calib + 8, sizeof(params));
-		printf("[ok] Калибровка (версия %u): offsets L(%.4f, %.4f) R(%.4f, %.4f)\n",
+		printf("[ok] Calibration (version %u): offsets L(%.4f, %.4f) R(%.4f, %.4f)\n",
 		       calib[0], params[0], params[1], params[2], params[3]);
 		printf("       scale L(%.4f, %.4f) R(%.4f, %.4f)\n",
 		       params[4], params[5], params[6], params[7]);
@@ -155,11 +155,11 @@ int main(void)
 		if (f != NULL) {
 			fwrite(calib, 1, sizeof(calib), f);
 			fclose(f);
-			printf("       Сохранена в psvr2_calibration.bin\n");
+			printf("       Saved to psvr2_calibration.bin\n");
 		}
 	}
 
-	printf("\nЧтение статуса и SLAM-поз (Ctrl+C для выхода)...\n\n");
+	printf("\nReading status and SLAM poses (Ctrl+C to exit)...\n\n");
 
 	uint8_t status_buf[1024];
 	uint8_t slam_buf[1024];
@@ -208,11 +208,11 @@ int main(void)
 		}
 	}
 
-	printf("\nИтого: %d статус-пакетов, %d SLAM-поз\n", status_count, slam_count);
+	printf("\nTotal: %d status packets, %d SLAM poses\n", status_count, slam_count);
 	if (slam_count > 0) {
-		printf("=== ТРЕКИНГ РАБОТАЕТ — можно писать плеер ===\n");
+		printf("=== TRACKING WORKS — ready to build the player ===\n");
 	} else if (status_count > 0) {
-		printf("=== Статус читается, но SLAM молчит (возможно, шлем не на голове / нет освещения) ===\n");
+		printf("=== Status is readable but SLAM is silent (headset may be off-head / no lighting) ===\n");
 	}
 
 	libusb_release_interface(dev, SLAM_INTERFACE);

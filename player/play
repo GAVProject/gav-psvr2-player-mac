@@ -1,8 +1,8 @@
 #!/bin/zsh
-# Запуск плеера как самостоятельного приложения (через open), а не дочерним
-# процессом терминала. Это важно для доступа к внешним дискам: иначе macOS
-# считает «ответственным» терминал и запрашивает права от его имени.
-# Лог приложения выводится сюда же.
+# Launch the player as a standalone application (via open), not as a child
+# process of the terminal. This matters for external-disk access: otherwise
+# macOS considers the terminal "responsible" and requests permissions on its behalf.
+# The application log is streamed here as well.
 cd "$(dirname "$0")"
 
 APP="$PWD/PSVR2Player.app"
@@ -10,14 +10,14 @@ BIN="$APP/Contents/MacOS/psvr2player"
 LOG="${TMPDIR:-/tmp}/psvr2player.log"
 
 if [[ ! -x "$BIN" ]]; then
-	echo "Нет собранного приложения. Выполните: make" >&2
+	echo "No built application. Run: make" >&2
 	exit 1
 fi
 
 : > "$LOG"
 open -a "$APP" --stdout "$LOG" --stderr "$LOG" --args "$@" || exit 1
 
-# Показываем лог, пока приложение работает
+# Show the log while the application is running
 tail -f "$LOG" &
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null' EXIT INT TERM

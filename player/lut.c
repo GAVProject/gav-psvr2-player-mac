@@ -1,4 +1,4 @@
-/* Таблица дисторсии/хроматики PSVR2 из драйвера Monado (BSL-1.0). */
+/* PSVR2 distortion/chromatic-aberration table from the Monado driver (BSL-1.0). */
 struct LookupItem_t { float r, g, b; };
 static const struct LookupItem_t lookup[] = {
     {0.856803, 0.863602, 0.870955}, {0.857020, 0.863827, 0.871189}, {0.857236, 0.864052, 0.871423},

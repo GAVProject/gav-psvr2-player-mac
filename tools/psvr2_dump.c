@@ -1,7 +1,7 @@
 /*
- * psvr2_dump — сырой дамп одного IN-эндпоинта PSVR2 в файл.
- * Использование: psvr2_dump <интерфейс> <эндпоинт hex> <секунды> <файл>
- * Пример: psvr2_dump 11 8c 3 /tmp/st.bin
+ * psvr2_dump — raw dump of a single PSVR2 IN endpoint to a file.
+ * Usage: psvr2_dump <interface> <endpoint hex> <seconds> <file>
+ * Example: psvr2_dump 11 8c 3 /tmp/st.bin
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -33,16 +33,16 @@ int main(int argc, char **argv)
 	libusb_init(&ctx);
 	libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
 	if (dev == NULL) {
-		fprintf(stderr, "PSVR2 не найден\n");
+		fprintf(stderr, "PSVR2 not found\n");
 		return 1;
 	}
 	if (libusb_claim_interface(dev, intf) != 0) {
-		fprintf(stderr, "интерфейс %d занят\n", intf);
+		fprintf(stderr, "interface %d is busy\n", intf);
 		return 1;
 	}
 	FILE *f = fopen(argv[4], "wb");
 	if (f == NULL) {
-		fprintf(stderr, "не открыть %s\n", argv[4]);
+		fprintf(stderr, "cannot open %s\n", argv[4]);
 		return 1;
 	}
 
@@ -57,11 +57,11 @@ int main(int argc, char **argv)
 			continue;
 		}
 		if (ret != 0) {
-			fprintf(stderr, "чтение: %s\n", libusb_error_name(ret));
+			fprintf(stderr, "read: %s\n", libusb_error_name(ret));
 			break;
 		}
 		if (transferred > 0) {
-			/* Маркер границы transfer'а: длина в файле-компаньоне */
+			/* Transfer boundary marker: length goes to the companion stream */
 			fprintf(stderr, "%d\n", transferred);
 			fwrite(buf, 1, transferred, f);
 			total += transferred;
@@ -69,7 +69,7 @@ int main(int argc, char **argv)
 		}
 	}
 	fclose(f);
-	printf("%d transfers, %lld байт\n", packets, total);
+	printf("%d transfers, %lld bytes\n", packets, total);
 	libusb_release_interface(dev, intf);
 	libusb_close(dev);
 	libusb_exit(ctx);

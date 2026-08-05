@@ -1,16 +1,16 @@
-// Passthrough: вид с передних камер шлема.
+// Passthrough: view from the headset's front cameras.
 //
-// C-ядро (cpsvr2.c) читает кадры с USB в фоне; здесь они выгружаются в пару
-// BC4-текстур (левая и правая камеры). BC4 — блочный формат Metal
-// (.bc4_rUnorm), декодируется GPU бесплатно, поэтому кадры идут в текстуру
-// как есть, без распаковки на CPU.
+// The C core (cpsvr2.c) reads frames from USB in the background; here they are
+// uploaded into a pair of BC4 textures (left and right cameras). BC4 is a Metal
+// block format (.bc4_rUnorm) decoded by the GPU for free, so frames go into
+// the texture as-is, without CPU unpacking.
 
 import Metal
 
 final class PassthroughSource {
     static let width = Int(PSVR2_CAM_WIDTH)
     static let height = Int(PSVR2_CAM_HEIGHT)
-    // BC4: 4 бита на пиксель (составной макрос из cpsvr2.h в Swift не виден)
+    // BC4: 4 bits per pixel (the composite macro from cpsvr2.h isn't visible in Swift)
     private static let planeBytes = width * height / 2
 
     private(set) var textureL: MTLTexture?
@@ -18,38 +18,39 @@ final class PassthroughSource {
     private(set) var active = false
     private(set) var gotFrame = false
 
-    // Угол обзора камер: точной калибровки объектива у нас нет,
-    // подбирается на глаз клавишами +/-
+    // Camera field of view: we have no precise lens calibration,
+    // tuned by eye with the +/- keys
     var fovDeg: Float = 150
     var brightness: Float = 1.6
 
-    // Камеры разнесены шире глаз, поэтому стерео получается преувеличенным
-    // («гиперстерео») и сводится с трудом. Клавиша M переключает режим,
-    // моно — гарантированно комфортный вариант.
+    // The cameras are spaced wider than the eyes, so the stereo comes out
+    // exaggerated ("hyperstereo") and is hard to fuse. The M key switches
+    // the mode; mono is the guaranteed-comfortable option.
     enum Source: Int32, CaseIterable {
         case stereo = 2, mono0 = 0, mono1 = 1
 
         var label: String {
             switch self {
-            case .stereo: return "стерео"
-            case .mono0: return "моно (левая камера)"
-            case .mono1: return "моно (правая камера)"
+            case .stereo: return "stereo"
+            case .mono0: return "mono (left camera)"
+            case .mono1: return "mono (right camera)"
             }
         }
     }
     var source = Source.stereo
 
-    // Конвергенция: сдвиг картинок навстречу друг другу в долях кадра.
-    // Компенсирует разнос камер (он заметно шире межзрачкового расстояния).
-    // 0.100 подобрано на живом просмотре; правится клавишами «,» и «.»
+    // Convergence: shifting the images toward each other, in fractions of the
+    // frame. Compensates for the camera spacing (noticeably wider than the
+    // interpupillary distance). 0.100 tuned by live viewing; adjusted with
+    // the "," and "." keys
     var convergence: Float = 0.100
 
     private var bufL = [UInt8](repeating: 0, count: planeBytes)
     private var bufR = [UInt8](repeating: 0, count: planeBytes)
 
     init(device: MTLDevice) {
-        // BC4 поддерживается на Apple Silicon; если формат недоступен,
-        // passthrough просто не включится
+        // BC4 is supported on Apple Silicon; if the format is unavailable,
+        // passthrough simply won't turn on
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bc4_rUnorm, width: Self.width, height: Self.height,
             mipmapped: false)
@@ -64,12 +65,12 @@ final class PassthroughSource {
     func start() -> Bool {
         guard available, !active else { return active }
         guard psvr2_camera_start() == 0 else {
-            print("[passthrough] камеры не запустились")
+            print("[passthrough] cameras failed to start")
             return false
         }
         active = true
         gotFrame = false
-        print("[passthrough] камеры включены")
+        print("[passthrough] cameras on")
         return true
     }
 
@@ -78,10 +79,10 @@ final class PassthroughSource {
         active = false
         gotFrame = false
         psvr2_camera_stop()
-        print("[passthrough] камеры выключены")
+        print("[passthrough] cameras off")
     }
 
-    // Вызывается каждый кадр рендера
+    // Called every render frame
     func update() {
         guard active, let tl = textureL, let tr = textureR else { return }
         var fresh: Int32 = 0
@@ -92,7 +93,7 @@ final class PassthroughSource {
         }
         guard fresh == 1 else { return }
 
-        // BC4: 4 бита на пиксель, блок 4x4 = 8 байт -> строка блоков = width*2 байт
+        // BC4: 4 bits per pixel, 4x4 block = 8 bytes -> block row = width*2 bytes
         let bytesPerRow = Self.width * 2
         let region = MTLRegionMake2D(0, 0, Self.width, Self.height)
         bufL.withUnsafeBytes {

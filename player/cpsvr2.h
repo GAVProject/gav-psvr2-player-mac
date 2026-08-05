@@ -1,66 +1,66 @@
-/* C-ядро PSVR2: чтение SLAM-поз шлема через libusb (протокол из драйвера Monado). */
+/* PSVR2 C core: reading headset SLAM poses via libusb (protocol from the Monado driver). */
 #pragma once
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Запуск: открывает устройство, захватывает интерфейсы, стартует поток чтения.
- * Возвращает 0 при успехе. */
+/* Start: opens the device, claims the interfaces, starts the read thread.
+ * Returns 0 on success. */
 int psvr2_start(void);
 
 void psvr2_stop(void);
 
-/* 1 — шлем подключён и позы поступают. */
+/* 1 — the headset is connected and poses are coming in. */
 int psvr2_connected(void);
 
-/* Последний сырой SLAM-кватернион и позиция.
- * quat_wxyz: w, x, y, z как в USB-пакете; pos_xyz: метры. Возвращает 1, если поза валидна. */
+/* Last raw SLAM quaternion and position.
+ * quat_wxyz: w, x, y, z as in the USB packet; pos_xyz: meters. Returns 1 if the pose is valid. */
 int psvr2_get_pose(float quat_wxyz[4], float pos_xyz[3]);
 
-/* Датчик приближения (шлем надет) и IPD в мм. */
+/* Proximity sensor (headset is worn) and IPD in mm. */
 int psvr2_get_status(int *proximity, int *ipd_mm);
 
-/* Угловая скорость (рад/с, оси как у кватерниона после маппинга Monado)
- * и возраст последней SLAM-позы в секундах — для предсказания. */
+/* Angular velocity (rad/s, axes match the quaternion after Monado mapping)
+ * and the age of the last SLAM pose in seconds — for prediction. */
 int psvr2_get_motion(float gyro_radps[3], double *slam_age_s);
 
-/* Предсказанный кватернион: последняя SLAM-поза, доинтегрированная всеми
- * IMU-сэмплами после неё (по общим VTS-таймстампам) плюс экстраполяция
- * на lookahead_s вперёд. Кватернион УЖЕ в осях Monado-маппинга
- * (x-вправо, y-вверх, -z-вперёд до поправки на 90°); remap в вызывающем
- * коде не нужен. Возвращает 1, если поза валидна. */
+/* Predicted quaternion: the last SLAM pose, integrated forward with all
+ * IMU samples after it (by shared VTS timestamps) plus extrapolation
+ * lookahead_s ahead. The quaternion is ALREADY in Monado-mapped axes
+ * (x-right, y-up, -z-forward before the 90-degree correction); no remap
+ * needed in the caller. Returns 1 if the pose is valid. */
 int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4]);
 
-/* Кнопка Fn на шлеме: 1 — нажата. */
+/* Fn button on the headset: 1 — pressed. */
 int psvr2_get_button(void);
 
-/* Яркость дисплея 0..1. */
+/* Display brightness 0..1. */
 int psvr2_set_brightness(float brightness);
 
-/* 8 параметров дисторсии, посчитанных из калибровки шлема (как в Monado). */
+/* 8 distortion parameters computed from the headset calibration (as in Monado). */
 int psvr2_get_distortion_calibration(float out[8]);
 
-/* Указатель на LUT 1024x3 float (r,g,b). */
+/* Pointer to the 1024x3 float LUT (r,g,b). */
 const float *psvr2_distortion_lut(void);
 
-/* --- Камеры шлема (passthrough) ---
- * Кадры приходят парой BC4-текстур 1024x1016 (левая и правая камеры),
- * 60 Гц. Протокол из PSVR2Toolkit: включение vendor-командой 0x0B,
- * поток на интерфейсе 6, EP 0x87, сигнатура пакета 'V','I'. */
+/* --- Headset cameras (passthrough) ---
+ * Frames arrive as a pair of 1024x1016 BC4 textures (left and right cameras),
+ * 60 Hz. Protocol from PSVR2Toolkit: enabled with vendor command 0x0B,
+ * stream on interface 6, EP 0x87, packet signature 'V','I'. */
 
 #define PSVR2_CAM_WIDTH 1024
 #define PSVR2_CAM_HEIGHT 1016
-/* BC4: 4 бита на пиксель */
+/* BC4: 4 bits per pixel */
 #define PSVR2_CAM_PLANE_BYTES (PSVR2_CAM_WIDTH * PSVR2_CAM_HEIGHT / 2)
 
-/* Включает камеры и запускает поток чтения. 0 — успех. */
+/* Powers on the cameras and starts the read thread. 0 — success. */
 int psvr2_camera_start(void);
 
 void psvr2_camera_stop(void);
 
-/* Копирует последний кадр: left и right — буферы по PSVR2_CAM_PLANE_BYTES.
- * Возвращает 1, если кадр новый (с прошлого вызова), иначе 0. */
+/* Copies the last frame: left and right are PSVR2_CAM_PLANE_BYTES buffers each.
+ * Returns 1 if the frame is new (since the previous call), 0 otherwise. */
 int psvr2_camera_get_frame(unsigned char *left, unsigned char *right);
 
 #ifdef __cplusplus

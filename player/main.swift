@@ -1,11 +1,11 @@
-// PSVR2 Player — просмотр 180°/360° видео в PlayStation VR2 на macOS.
+// PSVR2 Player — 180°/360° video playback on PlayStation VR2 under macOS.
 //
-// Видео выводится на дисплей шлема (4000x2040, side-by-side), ориентация головы
-// читается из SLAM-потока шлема по USB (см. cpsvr2.c), дисторсия линз
-// корректируется по калибровке конкретного экземпляра шлема.
+// Video is output to the headset display (4000x2040, side-by-side), head
+// orientation is read from the headset's SLAM stream over USB (see cpsvr2.c),
+// lens distortion is corrected using the calibration of the specific headset unit.
 //
-// Клавиши: Space — пауза, R — рецентр, F — проекция, G — стерео-раскладка,
-// V — вертикальный флип, стрелки — перемотка, +/- — FOV fisheye, Q — выход.
+// Keys: Space — pause, R — recenter, F — projection, G — stereo layout,
+// V — vertical flip, arrows — seek, +/- — fisheye FOV, Q — quit.
 
 import AppKit
 import AVFoundation
@@ -15,7 +15,7 @@ import MetalKit
 import VideoToolbox
 import simd
 
-// MARK: - Метал-шейдер
+// MARK: - Metal shader
 
 let shaderSource = #"""
 #include <metal_stdlib>
@@ -30,23 +30,23 @@ vertex VSOut vs_main(uint vid [[vertex_id]]) {
     float2 p[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
     VSOut o;
     o.pos = float4(p[vid], 0.0, 1.0);
-    // uv: (0,0) — левый верх экрана, y вниз
+    // uv: (0,0) — top-left of the screen, y goes down
     o.uv = float2(p[vid].x * 0.5 + 0.5, 1.0 - (p[vid].y * 0.5 + 0.5));
     return o;
 }
 
 struct Uniforms {
     float4x4 rot;
-    float4x4 panelInv; // мир -> система панели (якорь взгляда в момент показа)
-    float4 calibL;   // k1,k2,k3,k4 левого глаза
+    float4x4 panelInv; // world -> panel space (gaze anchor at the moment it was shown)
+    float4 calibL;   // k1,k2,k3,k4 of the left eye
     float4 calibR;
     float4 p0;       // mode, stereo, fisheyeFovRad, flipV
-    float4 p1;       // гироскоп в мировых осях (xyz) + длительность развёртки (w), с
-    float4 p2;       // x: хроматика, y: панель UI видима, zw: курсор (uv текстуры панели)
-    float4 p3;       // панель в tan-пространстве: центр (xy), полуразмеры (zw)
-    float4 p4;       // x: есть видео, y: полный диапазон YUV, z: BT.2020, w: кадр BGRA
-    float4 p5;       // x: passthrough вкл, y: FOV камер (рад), z: яркость, w: режим камер
-    float4 p6;       // x: конвергенция камер (доли кадра)
+    float4 p1;       // gyro in world axes (xyz) + scanout duration (w), seconds
+    float4 p2;       // x: chromatic, y: UI panel visible, zw: cursor (panel texture uv)
+    float4 p3;       // panel in tan space: center (xy), half-sizes (zw)
+    float4 p4;       // x: has video, y: full-range YUV, z: BT.2020, w: BGRA frame
+    float4 p5;       // x: passthrough on, y: camera FOV (rad), z: brightness, w: camera mode
+    float4 p6;       // x: camera convergence (fraction of frame)
 };
 
 constant float FX = 0.3585564;
@@ -57,21 +57,21 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
     float u, v;
     valid = true;
     if (mode == 2) {
-        // равноудалённый fisheye, ось вперёд -Z
+        // equidistant fisheye, forward axis -Z
         float cosT = clamp(-w.z, -1.0, 1.0);
         float theta = acos(cosT);
         if (theta > fovRad * 0.5) { valid = false; return float2(0.0); }
         float2 xy = w.xy;
         float len = length(xy);
         float2 d = len > 1e-6 ? xy / len : float2(0.0);
-        float r = theta / fovRad;   // 0..0.5 на краю
+        float r = theta / fovRad;   // 0..0.5 at the edge
         u = 0.5 + r * d.x;
         v = 0.5 - r * d.y;
     } else {
         float lon = atan2(w.x, -w.z);
         float lat = asin(clamp(w.y, -1.0, 1.0));
         if (mode == 1) {
-            // полу-эквирект 180°
+            // half-equirect 180°
             if (fabs(lon) > PI * 0.5) { valid = false; return float2(0.0); }
             u = lon / PI + 0.5;
         } else {
@@ -87,8 +87,8 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
     return float2(u, v);
 }
 
-// Кадры берём в родном YUV 4:2:0 (втрое меньше памяти, чем BGRA: для 8K
-// это критично) и переводим в RGB здесь
+// Frames come in native YUV 4:2:0 (a third of the memory of BGRA: critical
+// for 8K) and are converted to RGB here
 static float3 yuv_to_rgb(float y, float2 cbcr, bool fullRange, bool bt2020) {
     if (!fullRange) {
         y = (y - 16.0 / 255.0) * (255.0 / 219.0);
@@ -156,8 +156,8 @@ fragment float4 fs_main(VSOut in [[stage_in]],
     float cxTan = eye == 0 ? 0.6603788 : 0.3396213;
     float3 rgb = float3(0.0);
 
-    // Поправка на развёртку: панель сканируется сверху вниз, строка uv.y
-    // видит позу со сдвигом по времени относительно середины кадра
+    // Scanout correction: the panel scans top to bottom, so row uv.y sees
+    // the pose time-shifted relative to the middle of the frame
     float3 gyroW = uni.p1.xyz;
     float rowTime = (in.uv.y - 0.5) * uni.p1.w;
 
@@ -173,7 +173,7 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float tanx = k3 * a - k4 * b;
         float tanyDown = k4 * a + k3 * b;
 
-        // За пределами области рендера (uv глаза вне [0,1]) — чёрный
+        // Outside the render area (per-eye uv outside [0,1]) — black
         float uvx = tanx * FX + cxTan;
         float uvy = tanyDown * FY + 0.5;
         if (uvx < 0.0 || uvx > 1.0 || uvy < 0.0 || uvy > 1.0) {
@@ -199,7 +199,7 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                 sampled = yuv_to_rgb(yv, cc, fullRange, bt2020);
             }
         } else {
-            sampled = float3(0.16); // фон, когда файл не открыт
+            sampled = float3(0.16); // background when no file is open
         }
 
         if (chromatic) {
@@ -209,9 +209,10 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         }
     }
 
-    // Passthrough: вид с передних камер шлема. Камеры жёстко связаны с
-    // корпусом, поэтому поза головы не применяется — картинка стоит в поле
-    // зрения. Модель объектива — равноудалённая (fisheye), FOV настраивается.
+    // Passthrough: view from the headset's front cameras. The cameras are
+    // rigidly attached to the body, so head pose is not applied — the image
+    // stays fixed in the field of view. Lens model is equidistant (fisheye),
+    // FOV is adjustable.
     if (uni.p5.x > 0.5) {
         float aG = local_x * scale[1];
         float bG = (local_y - 0.0002302693) * scale[1];
@@ -225,15 +226,15 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             float2 xy = dir.xy;
             float len = length(xy);
             float2 d = len > 1e-6 ? xy / len : float2(0.0);
-            // p5.w: 0 — левая камера на оба глаза, 1 — правая, 2 — стерео.
-            // p6.x — конвергенция: сдвиг картинок навстречу, компенсирует
-            // разнос камер (он шире межзрачкового)
+            // p5.w: 0 — left camera to both eyes, 1 — right, 2 — stereo.
+            // p6.x — convergence: shifts the images toward each other,
+            // compensating the camera baseline (wider than the IPD)
             int camMode = int(uni.p5.w);
             bool stereoMode = camMode == 2;
             bool useR = camMode == 1 || (stereoMode && eye == 1);
             float shift = stereoMode ? (eye == 0 ? uni.p6.x : -uni.p6.x) : 0.0;
 
-            // Кадр 1016x1016 лежит в текстуре шириной 1024
+            // The 1016x1016 frame sits in a 1024-wide texture
             float u = (0.5 + r * d.x + shift) * (1016.0 / 1024.0);
             float v = 0.5 - r * d.y;
             float g = useR ? camR.sample(smp, float2(u, v)).r
@@ -244,10 +245,10 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         }
     }
 
-    // Панель управления: закреплена в пространстве по направлению взгляда
-    // в момент показа (~1.5 м, лёгкий параллакс). Направление луча переводим
-    // текущей позой в мир, затем в систему панели; координаты по зелёному
-    // каналу без флипа видео
+    // Control panel: anchored in space along the gaze direction at the moment
+    // it was shown (~1.5 m, slight parallax). The ray direction is transformed
+    // by the current pose into world space, then into panel space; coordinates
+    // use the green channel, without the video flip
     if (uni.p2.y > 0.5) {
         float aG = local_x * scale[1];
         float bG = (local_y - 0.0002302693) * scale[1];
@@ -262,15 +263,15 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             float2 ph = uni.p3.zw;
             float pu = (pDir.x / -pDir.z - disp - pc.x) / (2.0 * ph.x) + 0.5;
             float pv = (pDir.y / -pDir.z - pc.y) / (2.0 * ph.y) + 0.5;
-            // Поле вокруг панели (значения согласованы с UIOverlay.marginU/V):
-            // курсор может выйти за край, клик там скрывает панель;
-            // текстура по краю прозрачная, clamp_to_edge не мажет
+            // Margin around the panel (values match UIOverlay.marginU/V):
+            // the cursor may go past the edge, clicking there hides the panel;
+            // the texture edge is transparent, so clamp_to_edge doesn't smear
             if (pu >= -0.05 && pu <= 1.05 && pv >= -0.10 && pv <= 1.10) {
                 float2 tuv = float2(pu, 1.0 - pv);
                 float4 uiC = ui.sample(smp, tuv);
 
-                // Виртуальный курсор: белая точка с тёмной обводкой
-                float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // аспект панели 2:1
+                // Virtual cursor: white dot with a dark outline
+                float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // panel aspect 2:1
                 float dcur = length(dvec);
                 if (dcur < 0.014) {
                     uiC = float4(1.0, 1.0, 1.0, 1.0);
@@ -287,7 +288,7 @@ fragment float4 fs_main(VSOut in [[stage_in]],
 }
 """#
 
-// MARK: - Настройки воспроизведения
+// MARK: - Playback settings
 
 enum Projection: Int32, CaseIterable {
     case equirect360 = 0
@@ -296,8 +297,8 @@ enum Projection: Int32, CaseIterable {
 
     var label: String {
         switch self {
-        case .equirect360: return "равнопромежуточная 360°"
-        case .equirect180: return "полу-эквирект 180°"
+        case .equirect360: return "equirect 360°"
+        case .equirect180: return "half-equirect 180°"
         case .fisheye: return "fisheye"
         }
     }
@@ -318,15 +319,15 @@ enum StereoLayout: Int32, CaseIterable {
 
     var label: String {
         switch self {
-        case .mono: return "моно"
-        case .sbs: return "стерео SBS"
-        case .tb: return "стерео верх/низ"
+        case .mono: return "mono"
+        case .sbs: return "stereo SBS"
+        case .tb: return "stereo top/bottom"
         }
     }
 
     var shortLabel: String {
         switch self {
-        case .mono: return "моно"
+        case .mono: return "mono"
         case .sbs: return "SBS"
         case .tb: return "TB"
         }
@@ -339,7 +340,7 @@ struct PlaybackConfig {
     var fisheyeFovDeg: Float = 190
     var flipV: Float = 1
 
-    // Угадать формат по имени файла
+    // Guess the format from the file name
     static func detect(from name: String) -> PlaybackConfig {
         var cfg = PlaybackConfig()
         let n = name.uppercased()
@@ -367,7 +368,7 @@ struct PlaybackConfig {
     }
 }
 
-// MARK: - Трекинг головы
+// MARK: - Head tracking
 
 final class HeadTracker {
     private var recenter = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -375,13 +376,14 @@ final class HeadTracker {
     private let correction = simd_quatf(ix: 0, iy: 0, iz: sqrt(0.5), r: sqrt(0.5))
     var connected = false
     var predictionEnabled = true
-    // Задержка вывода: рендер + сканаут дисплея (настраивается [ и ])
+    // Output latency: render + display scanout (adjusted with [ and ])
     var extraLookaheadS: Float = 0.010
 
-    // Ориентация в системе x-вправо, y-вверх, -z-вперёд (оси Monado)
+    // Orientation in x-right, y-up, -z-forward space (Monado axes)
     private func currentOrientation() -> simd_quatf? {
-        // SLAM обновляется ~60 Гц, рендер — 120 Гц: C-ядро доинтегрирует позу
-        // IMU-сэмплами (2000 Гц) и экстраполирует на задержку вывода
+        // SLAM updates at ~60 Hz, render at 120 Hz: the C core integrates the
+        // pose forward with IMU samples (2000 Hz) and extrapolates by the
+        // output latency
         if predictionEnabled {
             var q = [Float](repeating: 0, count: 4)
             guard psvr2_get_predicted_quat(extraLookaheadS, &q) == 1 else { return nil }
@@ -396,11 +398,11 @@ final class HeadTracker {
         return (correction * mapped).normalized
     }
 
-    // Ручная подстройка вида (перетаскивание сцены правой кнопкой):
-    // только наклон вперёд/назад. Горизонтальное выравнивание делает рецентр,
-    // а ручное рысканье в сочетании с наклоном геометрически рождает крен
-    // и «перелёт через полюс» — поэтому его нет.
-    // Мышь задаёт цель, кадры плавно подтягиваются slerp-доводчиком
+    // Manual view adjustment (dragging the scene with the right button):
+    // pitch only. Horizontal alignment is handled by recenter, and manual yaw
+    // combined with pitch geometrically produces roll and "flying over the
+    // pole" — so there is none.
+    // The mouse sets the target; frames catch up smoothly via a slerp follower
     private var offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var offsetCurrent = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var manualPitch: Float = 0
@@ -413,8 +415,8 @@ final class HeadTracker {
         offsetCurrent = offsetTarget
     }
 
-    // Полный рецентр (долгое нажатие Fn): центр видео — ровно туда, куда
-    // сейчас направлен взгляд, включая наклон головы. Для просмотра лёжа
+    // Full recenter (long Fn press): the video center goes exactly where the
+    // gaze points right now, including head pitch. For watching while lying down
     func requestFullRecenter() {
         guard let q = currentOrientation() else {
             requestRecenter()
@@ -424,16 +426,16 @@ final class HeadTracker {
         let yaw = atan2(-f.x, -f.z)
         recenter = simd_quatf(angle: -yaw, axis: SIMD3<Float>(0, 1, 0))
         didAutoRecenter = true
-        // Компенсируем наклон головы ручным наклоном сцены
+        // Compensate head pitch with a manual scene pitch
         manualPitch = max(-1.4, min(1.4, -asin(max(-1, min(1, f.y)))))
         offsetTarget = simd_quatf(angle: manualPitch, axis: SIMD3<Float>(1, 0, 0))
         offsetCurrent = offsetTarget
     }
 
     func addManualRotation(dxPx: Double, dyPx: Double) {
-        _ = dxPx // горизонталь намеренно игнорируется
-        let sens: Float = 0.002 // рад на пиксель (~0.11°)
-        // Наклон ограничен ~±80°
+        _ = dxPx // horizontal is intentionally ignored
+        let sens: Float = 0.002 // rad per pixel (~0.11°)
+        // Pitch limited to ~±80°
         manualPitch = max(-1.4, min(1.4, manualPitch + Float(dyPx) * sens))
         offsetTarget = simd_quatf(angle: manualPitch, axis: SIMD3<Float>(1, 0, 0))
     }
@@ -442,16 +444,16 @@ final class HeadTracker {
         let now = CACurrentMediaTime()
         let dt = Float(min(0.1, now - lastSmoothTime))
         lastSmoothTime = now
-        // Экспоненциальный доводчик, ~90 мс до цели
+        // Exponential follower, ~90 ms to target
         let alpha = 1 - expf(-dt * 12)
         offsetCurrent = simd_slerp(offsetCurrent, offsetTarget, alpha)
     }
 
-    // Угловая скорость в мировой (уже отрецентренной) системе — для
-    // построчной коррекции развёртки в шейдере
+    // Angular velocity in world (already recentered) space — for per-row
+    // scanout correction in the shader
     private(set) var worldAngularVelocity = SIMD3<Float>(repeating: 0)
 
-    // Последняя поза вида — для якоря панели UI
+    // Last view pose — used to anchor the UI panel
     private(set) var viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
 
     func viewRotation() -> float4x4 {
@@ -463,7 +465,7 @@ final class HeadTracker {
         connected = true
 
         if !didAutoRecenter {
-            // Убираем только рысканье (yaw), сохраняя горизонт
+            // Remove yaw only, keeping the horizon
             let f = q.act(SIMD3<Float>(0, 0, -1))
             let yaw = atan2(-f.x, -f.z)
             recenter = simd_quatf(angle: -yaw, axis: SIMD3<Float>(0, 1, 0))
@@ -477,7 +479,7 @@ final class HeadTracker {
         var gyro = [Float](repeating: 0, count: 3)
         var age: Double = 0
         if psvr2_get_motion(&gyro, &age) == 1 {
-            // Гироскоп в осях тела -> мировые оси текущего вида
+            // Gyro in body axes -> world axes of the current view
             worldAngularVelocity = view.act(SIMD3<Float>(gyro[0], gyro[1], gyro[2]))
         } else {
             worldAngularVelocity = .zero
@@ -491,19 +493,19 @@ final class HeadTracker {
 
 struct Uniforms {
     var rot: float4x4
-    var panelInv: float4x4 // мир -> система панели (якорь в момент показа)
+    var panelInv: float4x4 // world -> panel space (anchor at the moment it was shown)
     var calibL: SIMD4<Float>
     var calibR: SIMD4<Float>
     var p0: SIMD4<Float>
-    var p1: SIMD4<Float> // гироскоп в мировых осях (xyz) + длительность развёртки, с
-    var p2: SIMD4<Float> // хроматика, панель видима, курсор uv
-    var p3: SIMD4<Float> // панель: центр и полуразмеры в tan-пространстве
-    var p4: SIMD4<Float> // есть видео, полный диапазон YUV, BT.2020
-    var p5: SIMD4<Float> // passthrough вкл, FOV камер (рад), яркость, режим камер
-    var p6: SIMD4<Float> // конвергенция камер
+    var p1: SIMD4<Float> // gyro in world axes (xyz) + scanout duration, seconds
+    var p2: SIMD4<Float> // chromatic, panel visible, cursor uv
+    var p3: SIMD4<Float> // panel: center and half-sizes in tan space
+    var p4: SIMD4<Float> // has video, full-range YUV, BT.2020
+    var p5: SIMD4<Float> // passthrough on, camera FOV (rad), brightness, camera mode
+    var p6: SIMD4<Float> // camera convergence
 }
 
-// MARK: - Видео
+// MARK: - Video
 
 final class VideoSource {
     let player: AVPlayer
@@ -521,8 +523,8 @@ final class VideoSource {
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
     private var gotAnyFrame = false
-    // Не все файлы отдают кадры в запрошенном формате: если кадров нет,
-    // по очереди пробуем другие варианты
+    // Not every file delivers frames in the requested format: if no frames
+    // arrive, try the other variants in turn
     private var formatAttempt = 0
 
     private enum OutputRecipe {
@@ -538,13 +540,13 @@ final class VideoSource {
     ]
 
     private static let formatAttempts: [OutputRecipe] = [
-        // Родной YUV: втрое меньше памяти, важно для 8K
+        // Native YUV: a third of the memory, important for 8K
         .attributes([
             kCVPixelBufferPixelFormatTypeKey as String: yuvFormats,
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]),
-        // MV-HEVC (стереовидео Apple/DeoVR): без явного запроса слоя
-        // декодер может не отдавать кадры вовсе
+        // MV-HEVC (Apple/DeoVR stereo video): without an explicit layer
+        // request the decoder may not deliver frames at all
         .settings([
             kCVPixelBufferPixelFormatTypeKey as String: yuvFormats,
             kCVPixelBufferMetalCompatibilityKey as String: true,
@@ -552,13 +554,13 @@ final class VideoSource {
                 kVTDecompressionPropertyKey_RequestedMVHEVCVideoLayerIDs as String: [0],
             ],
         ]),
-        // Только 8-битный YUV
+        // 8-bit YUV only
         .attributes([
             kCVPixelBufferPixelFormatTypeKey as String:
                 kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
             kCVPixelBufferMetalCompatibilityKey as String: true,
         ]),
-        // Пусть система выберет сама
+        // Let the system decide
         .attributes([kCVPixelBufferMetalCompatibilityKey as String: true]),
         .attributes(nil),
     ]
@@ -566,7 +568,7 @@ final class VideoSource {
     init(url: URL, device: MTLDevice) {
         self.url = url
         let item = AVPlayerItem(url: url)
-        // Без пережатия высоты тона звук на скоростях ≠ 1× превращается в писк
+        // Without pitch correction, audio at rates ≠ 1× turns into a squeak
         item.audioTimePitchAlgorithm = .timeDomain
         output = Self.makeOutput(attempt: 0)
         item.add(output)
@@ -574,21 +576,21 @@ final class VideoSource {
         player.actionAtItemEnd = .pause
         CVMetalTextureCacheCreate(nil, nil, device, nil, &textureCache)
 
-        // В конце файла — стоп и перемотка в начало (без повтора);
-        // «Играть» запустит с начала
+        // At end of file — stop and rewind to the start (no looping);
+        // "Play" will start from the beginning
         describeTracks(item.asset)
 
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
             self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
-            print("[player] конец файла")
+            print("[player] end of file")
             if let self {
-                ResumeStore.set(nil, for: self.url) // досмотрен — с начала
+                ResumeStore.set(nil, for: self.url) // watched to the end — restart
             }
         }
 
-        // Периодически запоминаем позицию, чтобы продолжить с неё в другой раз
+        // Save the position periodically so playback can resume there next time
         saveTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             self?.savePosition()
         }
@@ -600,7 +602,7 @@ final class VideoSource {
         guard let item = player.currentItem, item.duration.isNumeric else { return }
         let t = player.currentTime().seconds
         let d = item.duration.seconds
-        guard t.isFinite, d > 60 else { return } // короткие ролики не запоминаем
+        guard t.isFinite, d > 60 else { return } // don't remember short clips
         if t > 15 && t < d - 30 {
             ResumeStore.set(t, for: url)
         } else if t >= d - 30 {
@@ -612,7 +614,7 @@ final class VideoSource {
         Task {
             guard let tracks = try? await asset.loadTracks(withMediaType: .video),
                   let track = tracks.first else {
-                print("[video] Видеодорожка не найдена")
+                print("[video] No video track found")
                 return
             }
             let size = (try? await track.load(.naturalSize)) ?? .zero
@@ -631,40 +633,40 @@ final class VideoSource {
                 ], encoding: .ascii) ?? "?"
 
                 if let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any] {
-                    // Признак многослойного (стерео) HEVC
+                    // Marker of multi-layer (stereo) HEVC
                     if exts.keys.contains(where: { $0.contains("Heroes") || $0.contains("MVHEVC") }) {
                         extra += ", MV-HEVC"
                     }
                     if let tags = exts["\(kCMFormatDescriptionExtension_ProjectionKind)"] {
-                        extra += ", проекция \(tags)"
+                        extra += ", projection \(tags)"
                     }
                 }
-                extra += ", слоёв: \(formats.count)"
+                extra += ", layers: \(formats.count)"
             }
 
-            print("[video] Дорожка: \(codec), \(Int(size.width))x\(Int(size.height)), "
+            print("[video] Track: \(codec), \(Int(size.width))x\(Int(size.height)), "
                 + "\(String(format: "%.0f", fps)) fps, "
-                + "декодируется: \(decodable ? "да" : "НЕТ"), "
-                + "воспроизводима: \(playable ? "да" : "НЕТ")\(extra)")
+                + "decodable: \(decodable ? "yes" : "NO"), "
+                + "playable: \(playable ? "yes" : "NO")\(extra)")
 
-            // hev1 хранит параметры кодека внутри потока — AVFoundation такое
-            // не декодирует, нужна перепаковка в hvc1 (без пережатия)
+            // hev1 keeps codec parameters inside the stream — AVFoundation
+            // cannot decode that; remuxing to hvc1 (lossless) is needed
             if codec == "hev1" || !decodable {
                 let hint = codec == "hev1"
-                    ? "Формат hev1 не поддерживается macOS. Перепакуйте без потерь:"
-                    : "Видеодорожка не декодируется. Возможно, поможет перепаковка:"
+                    ? "hev1 format is not supported by macOS. Remux losslessly:"
+                    : "Video track cannot be decoded. Remuxing may help:"
                 print("[video] \(hint)")
                 print("[video]   tools/fix-hev1 \"\(self.url.path)\"")
                 await MainActor.run {
                     self.onUnsupported?(codec == "hev1"
-                        ? "Формат hev1 не поддерживается — нужна перепаковка (см. лог)"
-                        : "Видео не декодируется (см. лог)")
+                        ? "hev1 format not supported — remux needed (see log)"
+                        : "Video cannot be decoded (see log)")
                 }
             }
         }
     }
 
-    // Явная остановка при замене файла
+    // Explicit stop when replacing the file
     func stop() {
         savePosition()
         saveTimer?.invalidate()
@@ -679,13 +681,13 @@ final class VideoSource {
 
     deinit {
         stop()
-        // Диагностика: если эта строка не появляется при смене файла —
-        // старый источник кто-то держит
-        print("[video] источник освобождён: \(url.lastPathComponent)")
+        // Diagnostics: if this line doesn't appear when switching files,
+        // something is holding on to the old source
+        print("[video] source released: \(url.lastPathComponent)")
     }
 
     func routeAudioToHeadset() {
-        // Ищем аудиовыход "PS VR2" через CoreAudio и направляем звук туда
+        // Find the "PS VR2" audio output via CoreAudio and route sound there
         var addr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -720,19 +722,19 @@ final class VideoSource {
                 if uidErr == noErr {
                     player.audioOutputDeviceUniqueID = uid as String
                     audioDeviceID = id
-                    print("[audio] Звук направлен в шлем: \(name)")
+                    print("[audio] Audio routed to headset: \(name)")
                 }
                 return
             }
         }
     }
 
-    // «Виртуальная» системная громкость устройства ('vmvc') — ей управляет
-    // ползунок в настройках звука, когда у USB-устройства нет своего регулятора
+    // The device's "virtual" system volume ('vmvc') — controlled by the slider
+    // in Sound settings when the USB device has no volume control of its own
     private static let virtualMainVolume = AudioObjectPropertySelector(0x766D_7663) // 'vmvc'
 
-    // Пары (селектор, элемент) в порядке предпочтения: аппаратный регулятор,
-    // поканальный, затем виртуальная громкость macOS
+    // (selector, element) pairs in order of preference: hardware control,
+    // per-channel, then the macOS virtual volume
     private var volumeAddresses: [AudioObjectPropertyAddress] {
         let candidates: [(AudioObjectPropertySelector, UInt32)] = [
             (kAudioDevicePropertyVolumeScalar, UInt32(kAudioObjectPropertyElementMain)),
@@ -771,7 +773,7 @@ final class VideoSource {
             if AudioObjectSetPropertyData(id, &addr, 0, nil, size, &vol) == noErr {
                 ok = true
                 if addr.mSelector != kAudioDevicePropertyVolumeScalar || addr.mElement == UInt32(kAudioObjectPropertyElementMain) {
-                    break // главный или виртуальный регулятор достаточно установить один раз
+                    break // main or virtual control only needs to be set once
                 }
             }
         }
@@ -792,8 +794,8 @@ final class VideoSource {
 
     func updateTexture() {
         let t = output.itemTime(forHostTime: CACurrentMediaTime())
-        // Без проверки hasNewPixelBuffer: часть файлов отдаёт кадры,
-        // не сообщая о них через этот флаг
+        // No hasNewPixelBuffer check: some files deliver frames without
+        // reporting them via that flag
         guard let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil),
               let cache = textureCache else {
             retryOtherFormatIfNeeded()
@@ -820,11 +822,11 @@ final class VideoSource {
                 UInt8((format >> 8) & 0xff), UInt8(format & 0xff),
             ], encoding: .ascii) ?? "?"
             print("[video] \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
-                + "\(fourCC), \(tenBit ? "10 бит" : "8 бит"), "
+                + "\(fourCC), \(tenBit ? "10-bit" : "8-bit"), "
                 + "\(fullRange ? "full" : "video") range, \(bt2020 ? "BT.2020" : "BT.709")")
         }
 
-        // Непланарный кадр (BGRA) — читаем как RGB, YUV-преобразование не нужно
+        // Non-planar frame (BGRA) — read as RGB, no YUV conversion needed
         isBGRA = CVPixelBufferGetPlaneCount(pb) == 0
         if isBGRA {
             if let tex = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm) {
@@ -853,13 +855,13 @@ final class VideoSource {
         let res = CVMetalTextureCacheCreateTextureFromImage(
             nil, cache, pb, nil, format, w, h, plane, &cvTex)
         guard res == kCVReturnSuccess, let cvTex else {
-            print("[video] не удалось создать текстуру плоскости \(plane): код \(res)")
+            print("[video] failed to create texture for plane \(plane): code \(res)")
             return nil
         }
         return CVMetalTextureGetTexture(cvTex)
     }
 
-    // Кадров нет — пробуем следующий формат пикселей
+    // No frames — try the next pixel format
     private func retryOtherFormatIfNeeded() {
         guard !gotAnyFrame, player.rate != 0,
               CACurrentMediaTime() - noFrameSince > 2,
@@ -867,10 +869,10 @@ final class VideoSource {
         noFrameSince = CACurrentMediaTime()
 
         guard formatAttempt + 1 < Self.formatAttempts.count else {
-            print("[video] Кадры не поступают ни в одном из форматов. Статус: "
+            print("[video] No frames arrive in any format. Status: "
                 + "\(item.status.rawValue)"
-                + (item.error.map { ", ошибка: \($0.localizedDescription)" } ?? ""))
-            gotAnyFrame = true // больше не пробуем
+                + (item.error.map { ", error: \($0.localizedDescription)" } ?? ""))
+            gotAnyFrame = true // stop trying
             return
         }
 
@@ -879,11 +881,11 @@ final class VideoSource {
         output = Self.makeOutput(attempt: formatAttempt)
         item.add(output)
         loggedFormat = false
-        print("[video] Кадров нет — переключаюсь на формат №\(formatAttempt + 1)")
+        print("[video] No frames — switching to format #\(formatAttempt + 1)")
     }
 }
 
-// MARK: - Рендерер
+// MARK: - Renderer
 
 final class Renderer: NSObject, MTKViewDelegate {
     let device: MTLDevice
@@ -892,8 +894,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     let lutBuffer: MTLBuffer
     let placeholderY: MTLTexture
     let placeholderCbCr: MTLTexture
-    // Окружение вместо серой пустоты, пока файл не открыт: equirect-панорама
-    // 360° из Resources (CC0, Poly Haven), грузится в фоне после старта
+    // Environment instead of gray emptiness while no file is open: a 360°
+    // equirect panorama from Resources (CC0, Poly Haven), loaded in the
+    // background after startup
     private var envTexture: MTLTexture?
     let tracker = HeadTracker()
     var video: VideoSource?
@@ -902,21 +905,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     var chromaticEnabled = true
     var scanlineEnabled = true
     var overlay: UIOverlay!
-    // Скорость воспроизведения; при открытии нового файла сбрасывается на 1×
+    // Playback rate; reset to 1× when a new file is opened
     var playbackRate: Float = 1.0
-    // Вид с камер шлема (двойное нажатие Fn или клавиша B)
+    // View from the headset cameras (double Fn press or the B key)
     var passthrough: PassthroughSource?
     private var pausedByPassthrough = false
-    // Панель UI в tan-пространстве: центр и полуразмеры (аспект 2:1 как текстура)
+    // UI panel in tan space: center and half-sizes (2:1 aspect like the texture)
     let panelCenter = SIMD2<Float>(0, -0.05)
     let panelHalf = SIMD2<Float>(0.5, 0.25)
-    // Якорь панели в мире: направление взгляда (yaw+pitch, без крена)
-    // в момент показа
+    // Panel anchor in world space: gaze direction (yaw+pitch, no roll)
+    // at the moment it was shown
     private var panelAnchor = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-    // Развёртка панели: 2040/2200 строки кадра при 120 Гц (из драйвера Monado)
+    // Panel scanout: 2040/2200 of the frame's rows at 120 Hz (from the Monado driver)
     let scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
 
-    // Диагностика
+    // Diagnostics
     private var statFrames = 0
     private var statGpuTime = 0.0
     private var statLastReport = CACurrentMediaTime()
@@ -955,8 +958,8 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         super.init()
 
-        // Декодирование 8k-панорамы небыстрое — не задерживаем запуск.
-        // SRGB=false: шейдер работает в гамма-пространстве, как и с видео
+        // Decoding the 8K panorama takes a while — don't delay startup.
+        // SRGB=false: the shader works in gamma space, same as with video
         if let url = Bundle.main.url(forResource: "environment", withExtension: "jpg") {
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 let loader = MTKTextureLoader(device: device)
@@ -971,14 +974,14 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var buttonLongFired = false
     private var pendingSingleClick = false
     private var lastClickTime = 0.0
-    // Автопауза по датчику приближения (шлем снят/надет), с дебаунсом
+    // Auto-pause via the proximity sensor (headset on/off), debounced
     private var wornState = true
     private var lastProxRaw = true
     private var proxRawSince = CACurrentMediaTime()
     private var autoPaused = false
-    // На старте шлем обычно лежит снятым, и авторецентр по первой позе
-    // смотрит куда попало. Заметив «снят», при первом надевании повторяем
-    // рецентр, чтобы сцена и панель оказались перед глазами
+    // At startup the headset usually lies taken off, and the auto-recenter
+    // from the first pose points anywhere. Once "off" is detected, repeat the
+    // recenter on first wear so the scene and panel end up in front of the eyes
     private var wornRecenterArmed = false
     private var didWornRecenter = false
     private var reanchorPanel = false
@@ -990,14 +993,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         if let p = video?.player, p.rate != 0 {
             p.rate = v
         }
-        overlay?.showOSD(String(format: "Скорость %g×", v))
-        print(String(format: "[player] скорость: %g×", v))
+        overlay?.showOSD(String(format: "Speed %g×", v))
+        print(String(format: "[player] speed: %g×", v))
     }
 
-    // Вид с камер: видео паузим, чтобы не пропустить кусок
+    // Camera view: pause the video so nothing is missed
     func togglePassthrough() {
         guard let pt = passthrough, pt.available else {
-            overlay?.showOSD("Камеры недоступны")
+            overlay?.showOSD("Cameras unavailable")
             return
         }
         if pt.active {
@@ -1009,19 +1012,19 @@ final class Renderer: NSObject, MTKViewDelegate {
             return
         }
         guard pt.start() else {
-            overlay?.showOSD("Камеры не запустились (см. лог)")
+            overlay?.showOSD("Cameras failed to start (see log)")
             return
         }
         if let p = video?.player, p.rate != 0 {
             p.pause()
             pausedByPassthrough = true
         }
-        // Никаких плашек и панели поверх камер: чистый вид на комнату
+        // No OSD or panel over the cameras: a clear view of the room
         overlay?.hide()
         overlay?.clearOSD()
     }
 
-    // Стоп: закрыть файл (позицию запоминаем) и вернуться к списку файлов
+    // Stop: close the file (position is saved) and return to the file list
     func stopVideo() {
         guard let v = video else { return }
         v.savePosition()
@@ -1029,11 +1032,11 @@ final class Renderer: NSObject, MTKViewDelegate {
         video = nil
         autoPaused = false
         pausedByPassthrough = false
-        print("[player] стоп — файл закрыт")
+        print("[player] stop — file closed")
         overlay?.openPicker()
     }
 
-    // Закрепить панель перед текущим взглядом (горизонт сохраняем)
+    // Anchor the panel in front of the current gaze (keeping the horizon)
     func anchorPanel() {
         let f = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
         let yaw = atan2(-f.x, -f.z)
@@ -1054,7 +1057,7 @@ final class Renderer: NSObject, MTKViewDelegate {
             proxRawSince = now
         }
 
-        // Первое надевание после запуска со снятым шлемом — рецентр
+        // First wear after starting with the headset off — recenter
         if !didWornRecenter {
             if !raw {
                 wornRecenterArmed = true
@@ -1062,15 +1065,15 @@ final class Renderer: NSObject, MTKViewDelegate {
                 didWornRecenter = true
                 tracker.requestRecenter()
                 reanchorPanel = true
-                print("[player] шлем надет — сцена и панель по взгляду")
+                print("[player] headset on — scene and panel aligned to gaze")
             }
         }
 
-        // Состояние принимается после 0.4 с стабильности
+        // A state is accepted after 0.4 s of stability
         guard raw != wornState, now - proxRawSince > 0.4 else { return }
         wornState = raw
-        // Мышь нужна плееру только пока шлем на голове: снял — курсор
-        // свободен, никакого альт-таба ради мыши
+        // The player needs the mouse only while the headset is worn: take it
+        // off and the cursor is free — no alt-tabbing just for the mouse
         overlay?.setWorn(wornState)
 
         guard let player = video?.player else { return }
@@ -1078,19 +1081,19 @@ final class Renderer: NSObject, MTKViewDelegate {
             if player.rate != 0 {
                 player.pause()
                 autoPaused = true
-                print("[player] шлем снят — пауза")
+                print("[player] headset off — pausing")
             }
         } else if autoPaused {
             player.play()
             autoPaused = false
-            print("[player] шлем надет — продолжаем")
+            print("[player] headset on — resuming")
         }
     }
 
     func draw(in view: MTKView) {
-        // Кнопка Fn на шлеме: одиночное нажатие — рецентр (горизонт
-        // сохраняется), двойное — вид с камер и обратно, долгое (>0.8 с) —
-        // центр видео точно по направлению взгляда
+        // Fn button on the headset: single press — recenter (horizon kept),
+        // double — camera view and back, long (>0.8 s) — video center exactly
+        // along the gaze direction
         let button = psvr2_get_button() == 1
         let nowBtn = CACurrentMediaTime()
         if button && !lastButton {
@@ -1101,24 +1104,24 @@ final class Renderer: NSObject, MTKViewDelegate {
             buttonLongFired = true
             pendingSingleClick = false
             tracker.requestFullRecenter()
-            overlay?.showOSD("Центр — по направлению взгляда")
-            print("[player] полный рецентр (долгое нажатие кнопки шлема)")
+            overlay?.showOSD("Centered on gaze direction")
+            print("[player] full recenter (long headset button press)")
         }
         if !button && lastButton && !buttonLongFired {
             if pendingSingleClick && nowBtn - lastClickTime < 0.45 {
-                pendingSingleClick = false // второй клик — двойное нажатие
+                pendingSingleClick = false // second click — double press
                 togglePassthrough()
-                print("[player] вид с камер (двойное нажатие кнопки шлема)")
+                print("[player] camera view (double headset button press)")
             } else {
                 pendingSingleClick = true
                 lastClickTime = nowBtn
             }
         }
-        // Одиночное нажатие срабатывает, когда пары уже не будет
+        // A single press fires once a pair can no longer happen
         if pendingSingleClick && nowBtn - lastClickTime > 0.45 {
             pendingSingleClick = false
             tracker.requestRecenter()
-            print("[player] рецентр (кнопка шлема)")
+            print("[player] recenter (headset button)")
         }
         lastButton = button
 
@@ -1134,16 +1137,16 @@ final class Renderer: NSObject, MTKViewDelegate {
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
         let rot = tracker.viewRotation()
-        // Якорим панель после применения рецентра (viewQuat уже свежий)
+        // Anchor the panel after recenter is applied (viewQuat is already fresh)
         if reanchorPanel {
             reanchorPanel = false
             anchorPanel()
         }
         let gyroW = scanlineEnabled ? tracker.worldAngularVelocity : .zero
 
-        // Панель закреплена в мире; одиночная плашка OSD — приклеена к взгляду
-        // (panelInv * rot = I). Если панель ушла из виду дальше ~70° —
-        // переносим её к текущему взгляду
+        // The panel is fixed in the world; a lone OSD toast is glued to the
+        // gaze (panelInv * rot = I). If the panel drifts more than ~70° out
+        // of view, move it to the current gaze
         let panelInv: float4x4
         if overlay?.active == true {
             let gaze = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
@@ -1155,8 +1158,8 @@ final class Renderer: NSObject, MTKViewDelegate {
             panelInv = rot.transpose
         }
 
-        // Без открытого файла показываем панораму окружения: она идёт по
-        // видеотракту шейдера как 360°-моно-BGRA «видео»
+        // With no file open, show the environment panorama: it goes through
+        // the shader's video path as a 360° mono BGRA "video"
         let env = video == nil ? envTexture : nil
 
         var uni = Uniforms(
@@ -1172,9 +1175,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
-                // Пока зажата ПКМ (вращение сцены), панель и курсор прячем
+                // While RMB is held (scene rotation), hide the panel and cursor
                 (overlay?.displayVisible ?? false) && NSEvent.pressedMouseButtons & 0x2 == 0 ? 1 : 0,
-                // Курсор показываем только с панелью (не с одной плашкой OSD)
+                // Show the cursor only with the panel (not with a lone OSD toast)
                 Float((overlay?.active ?? false) ? overlay!.cursorU : -10),
                 Float((overlay?.active ?? false) ? overlay!.cursorV : -10)),
             p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y),
@@ -1214,14 +1217,14 @@ final class Renderer: NSObject, MTKViewDelegate {
         if now - statLastReport >= 2.0 {
             let fps = Double(statFrames) / (now - statLastReport)
             let gpuMs = statFrames > 0 ? statGpuTime / Double(statFrames) * 1000 : 0
-            print(String(format: "[stat] fps=%.1f gpu=%.2fмс mem=%.0fМБ", fps, gpuMs, Self.memoryFootprintMB()))
+            print(String(format: "[stat] fps=%.1f gpu=%.2fms mem=%.0fMB", fps, gpuMs, Self.memoryFootprintMB()))
             statFrames = 0
             statGpuTime = 0
             statLastReport = now
         }
     }
 
-    // Физическая память процесса — для отлова утечек по логу
+    // Physical memory of the process — for spotting leaks in the log
     private static func memoryFootprintMB() -> Double {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
@@ -1235,21 +1238,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 }
 
-// MARK: - Окно и клавиатура
+// MARK: - Window and keyboard
 
 final class PlayerView: MTKView {
     var renderer: Renderer?
 
     override var acceptsFirstResponder: Bool { true }
-    // Клики по неключевому окну шлема (ключевое окно — пульт на мониторе)
+    // Clicks on the non-key headset window (the key window is the remote on the monitor)
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func keyDown(with event: NSEvent) {
         guard let r = renderer else { return }
         switch event.keyCode {
         case 12, 53: // Q, Esc
-            print("[player] выход")
-            r.overlay?.hide() // вернуть системный курсор
+            print("[player] quit")
+            r.overlay?.hide() // restore the system cursor
             r.video?.savePosition()
             r.video?.player.pause()
             psvr2_stop()
@@ -1258,28 +1261,28 @@ final class PlayerView: MTKView {
             togglePause()
         case 15: // R
             r.tracker.requestRecenter()
-            print("[player] рецентр")
+            print("[player] recenter")
         case 3: // F
             cycleProjection()
         case 5: // G
             cycleStereo()
         case 9: // V
             r.config.flipV *= -1
-            print("[player] вертикальный флип: \(r.config.flipV < 0 ? "вкл" : "выкл")")
-        case 11: // B — вид с камер шлема
+            print("[player] vertical flip: \(r.config.flipV < 0 ? "on" : "off")")
+        case 11: // B — headset camera view
             r.togglePassthrough()
-        case 46: // M — режим камер: стерео / моно левая / моно правая
+        case 46: // M — camera mode: stereo / mono left / mono right
             guard let pt = r.passthrough, pt.active else { break }
             let all = PassthroughSource.Source.allCases
             pt.source = all[(all.firstIndex(of: pt.source)! + 1) % all.count]
             r.overlay?.showOSD(pt.source.label)
-            print("[passthrough] режим: \(pt.source.label)")
-        case 43, 47: // «,» и «.» — сведение картинок (компенсация разноса камер)
+            print("[passthrough] mode: \(pt.source.label)")
+        case 43, 47: // "," and "." — image convergence (camera baseline compensation)
             guard let pt = r.passthrough, pt.active else { break }
             pt.convergence = max(-0.15, min(0.15,
                 pt.convergence + (event.keyCode == 47 ? 0.005 : -0.005)))
-            r.overlay?.showOSD(String(format: "Сведение: %+.3f", pt.convergence))
-            print(String(format: "[passthrough] сведение: %+.3f", pt.convergence))
+            r.overlay?.showOSD(String(format: "Convergence: %+.3f", pt.convergence))
+            print(String(format: "[passthrough] convergence: %+.3f", pt.convergence))
         case 123: // ←
             seek(by: -15)
         case 124: // →
@@ -1290,24 +1293,24 @@ final class PlayerView: MTKView {
             changeVolume(by: -0.05)
         case 35: // P
             r.tracker.predictionEnabled.toggle()
-            print("[player] предсказание позы: \(r.tracker.predictionEnabled ? "вкл" : "выкл")")
+            print("[player] pose prediction: \(r.tracker.predictionEnabled ? "on" : "off")")
         case 1: // S
             r.scanlineEnabled.toggle()
-            print("[player] коррекция развёртки: \(r.scanlineEnabled ? "вкл" : "выкл")")
+            print("[player] scanout correction: \(r.scanlineEnabled ? "on" : "off")")
         case 8: // C
             r.chromaticEnabled.toggle()
-            print("[player] хроматическая коррекция: \(r.chromaticEnabled ? "вкл" : "выкл")")
+            print("[player] chromatic correction: \(r.chromaticEnabled ? "on" : "off")")
         case 2: // D
             if let layer = self.layer as? CAMetalLayer {
                 layer.displaySyncEnabled.toggle()
-                print("[player] vsync презентации: \(layer.displaySyncEnabled ? "вкл" : "выкл")")
+                print("[player] presentation vsync: \(layer.displaySyncEnabled ? "on" : "off")")
             }
         case 30: // ]
             r.tracker.extraLookaheadS = min(0.08, r.tracker.extraLookaheadS + 0.005)
-            print("[player] упреждение позы: \(Int(r.tracker.extraLookaheadS * 1000)) мс")
+            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
         case 33: // [
             r.tracker.extraLookaheadS = max(0, r.tracker.extraLookaheadS - 0.005)
-            print("[player] упреждение позы: \(Int(r.tracker.extraLookaheadS * 1000)) мс")
+            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
         case 24, 69: // + (=)
             changeFov(by: 5)
         case 27, 78: // -
@@ -1319,30 +1322,30 @@ final class PlayerView: MTKView {
 
     private func changeFov(by delta: Float) {
         guard let r = renderer else { return }
-        // В режиме камер +/- подгоняют угол объектива под ощущение масштаба
+        // In camera mode, +/- tune the lens angle to match the sense of scale
         if let pt = r.passthrough, pt.active {
             pt.fovDeg = max(60, min(220, pt.fovDeg + delta))
-            r.overlay?.showOSD("FOV камер: \(Int(pt.fovDeg))°")
-            print("[passthrough] FOV камер: \(Int(pt.fovDeg))°")
+            r.overlay?.showOSD("Camera FOV: \(Int(pt.fovDeg))°")
+            print("[passthrough] camera FOV: \(Int(pt.fovDeg))°")
             return
         }
         r.config.fisheyeFovDeg += delta
         if r.config.projection == .fisheye {
             print("[player] fisheye FOV: \(r.config.fisheyeFovDeg)°")
         } else {
-            print("[player] fisheye FOV: \(r.config.fisheyeFovDeg)° — влияет только на проекцию fisheye (переключи клавишей F)")
+            print("[player] fisheye FOV: \(r.config.fisheyeFovDeg)° — only affects the fisheye projection (switch with F)")
         }
     }
 
     private func changeVolume(by delta: Float) {
         guard let video = renderer?.video else { return }
 
-        // Сначала крутим аппаратную громкость USB-аудио шлема, если она есть
+        // First adjust the headset's USB audio hardware volume, if present
         if let current = video.deviceVolume() {
             let target = max(0, min(1, current + delta))
             if video.setDeviceVolume(target) {
                 video.player.volume = 1
-                print("[player] громкость шлема (аппаратная): \(Int(target * 100))%")
+                print("[player] headset volume (hardware): \(Int(target * 100))%")
                 return
             }
         }
@@ -1351,8 +1354,8 @@ final class PlayerView: MTKView {
         p.volume = max(0, min(1, p.volume + delta))
         let percent = Int((p.volume * 100).rounded())
         UserDefaults.standard.set(p.volume, forKey: "volume")
-        renderer?.overlay?.showOSD("Громкость \(percent)%")
-        print("[player] громкость плеера: \(percent)%")
+        renderer?.overlay?.showOSD("Volume \(percent)%")
+        print("[player] player volume: \(percent)%")
     }
 
     private func seek(by seconds: Double) {
@@ -1368,7 +1371,7 @@ final class PlayerView: MTKView {
         } else {
             p.pause()
         }
-        print("[player] \(p.rate == 0 ? "пауза" : "воспроизведение")")
+        print("[player] \(p.rate == 0 ? "pause" : "play")")
     }
 
     private func cycleProjection() {
@@ -1376,7 +1379,7 @@ final class PlayerView: MTKView {
         let all = Projection.allCases
         let next = all[(all.firstIndex(of: r.config.projection)! + 1) % all.count]
         r.config.projection = next
-        print("[player] проекция: \(next.label)")
+        print("[player] projection: \(next.label)")
     }
 
     private func cycleStereo() {
@@ -1384,12 +1387,12 @@ final class PlayerView: MTKView {
         let all = StereoLayout.allCases
         let next = all[(all.firstIndex(of: r.config.stereo)! + 1) % all.count]
         r.config.stereo = next
-        print("[player] стерео: \(next.label)")
+        print("[player] stereo: \(next.label)")
     }
 
     override func rightMouseDragged(with event: NSEvent) {
         guard let r = renderer else { return }
-        // «Хватаем» сцену: тянем картинку за курсором
+        // "Grab" the scene: drag the image along with the cursor
         r.tracker.addManualRotation(dxPx: event.deltaX, dyPx: event.deltaY)
         r.overlay?.markActivity()
     }
@@ -1397,14 +1400,14 @@ final class PlayerView: MTKView {
     private var scrollAccum = 0.0
 
     override func scrollWheel(with event: NSEvent) {
-        // Прокрутка списка файлов. Тачпад шлёт поток мелких дельт и добавляет
-        // инерционный «выбег» после отрыва пальцев — от него список улетал бы
-        // на десятки строк, поэтому фазу инерции пропускаем, а дельты
-        // накапливаем до целой строки
+        // File list scrolling. The touchpad sends a stream of tiny deltas and
+        // adds inertial "coasting" after fingers lift — that would fling the
+        // list dozens of rows, so the momentum phase is skipped and deltas
+        // accumulate up to a whole row
         if event.momentumPhase != [] {
             return
         }
-        // У тачпада дельты «точные» и в разы мельче щелчка колеса
+        // Touchpad deltas are "precise" and much smaller than a wheel click
         scrollAccum += event.scrollingDeltaY / (event.hasPreciseScrollingDeltas ? 28 : 1)
         while abs(scrollAccum) >= 1 {
             renderer?.overlay?.scrollPicker(rows: scrollAccum > 0 ? -1 : 1)
@@ -1444,7 +1447,7 @@ final class PlayerView: MTKView {
         case .volUp: changeVolume(by: 0.05)
         case .recenter:
             r.tracker.requestRecenter()
-            print("[player] рецентр")
+            print("[player] recenter")
         case .cycleProjection: cycleProjection()
         case .cycleStereo: cycleStereo()
         case .seekFraction(let f):
@@ -1452,7 +1455,7 @@ final class PlayerView: MTKView {
                   item.duration.isNumeric else { break }
             let target = CMTime(seconds: item.duration.seconds * f, preferredTimescale: 600)
             p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
-            print("[player] перемотка на \(Int(item.duration.seconds * f)) с")
+            print("[player] seek to \(Int(item.duration.seconds * f)) s")
         }
     }
 }
@@ -1464,10 +1467,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var cvLink: CVDisplayLink?
     var playerView: PlayerView?
     var accessHelperWindow: NSWindow?
-    // Окно-пульт на обычном мониторе: держит клавиатурный фокус, чтобы
-    // системные диалоги открывались на видимом экране, а не в шлеме
+    // Remote-control window on the regular monitor: holds keyboard focus so
+    // system dialogs open on a visible screen, not inside the headset
     var controlWindow: NSWindow?
-    // Поля значений в таблице пульта, по идентификатору строки
+    // Value fields in the remote's table, by row identifier
     var controlValues: [String: NSTextField] = [:]
     var statusTimer: Timer?
     var sweeper: WindowSweeper?
@@ -1478,33 +1481,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // USB-трекинг
+        // USB tracking
         var calibration = [Float](repeating: 0, count: 8)
         if psvr2_start() == 0 {
-            print("[usb] PSVR2 подключён, SLAM-трекинг запущен")
+            print("[usb] PSVR2 connected, SLAM tracking started")
             psvr2_get_distortion_calibration(&calibration)
-            print("[usb] Калибровка дисторсии: \(calibration)")
+            print("[usb] Distortion calibration: \(calibration)")
             psvr2_set_brightness(1.0)
         } else {
-            print("[usb] !!! Шлем не найден по USB — рендер без трекинга")
+            print("[usb] !!! Headset not found on USB — rendering without tracking")
             calibration = [-0.09919293, 0, 0.09919293, 0, 1, 0, 1, 0]
         }
         if calibration[4] == 0 && calibration[6] == 0 {
-            // Старая версия калибровки: k3/k4 не заданы — единичный поворот
+            // Old calibration version: k3/k4 not set — identity rotation
             calibration[4] = 1
             calibration[6] = 1
         }
 
-        // Экран шлема
+        // Headset screen
         let vrScreen = NSScreen.screens.first {
             $0.localizedName.localizedCaseInsensitiveContains("PS VR2")
                 || ($0.frame.width * $0.backingScaleFactor) == 4000
         }
         let screen = vrScreen ?? NSScreen.main!
         if vrScreen == nil {
-            print("[display] !!! Дисплей PS VR2 не найден — вывод в окно на основном экране")
+            print("[display] !!! PS VR2 display not found — output to a window on the main screen")
         } else {
-            print("[display] Дисплей PS VR2: \(screen.frame)")
+            print("[display] PS VR2 display: \(screen.frame)")
         }
 
         let device = MTLCreateSystemDefaultDevice()!
@@ -1518,7 +1521,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         renderer.passthrough = PassthroughSource(device: device)
 
-        // Панель управления в шлеме (появляется при движении мыши)
+        // Control panel inside the headset (appears on mouse movement)
         let overlay = UIOverlay(device: device)
         overlay.renderer = renderer
         overlay.captureEnabled = vrScreen != nil
@@ -1540,16 +1543,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.renderer = renderer
         view.delegate = renderer
         view.colorPixelFormat = .bgra8Unorm
-        // Внутренний таймер MTKView может тикать от другого (60 Гц) дисплея —
-        // рисуем сами от CADisplayLink, привязанного к экрану окна
+        // MTKView's internal timer may tick from another (60 Hz) display —
+        // we draw ourselves from a CADisplayLink bound to the window's screen
         view.isPaused = true
         view.enableSetNeedsDisplay = false
         playerView = view
 
         if vrScreen != nil {
-            // Безрамочное окно шлема намеренно НЕ становится ключевым:
-            // клавиатурный фокус живёт в окне-пульте на мониторе, поэтому
-            // системные диалоги открываются там, где их видно
+            // The borderless headset window intentionally does NOT become key:
+            // keyboard focus lives in the remote window on the monitor, so
+            // system dialogs open where they can be seen
             window = NSWindow(
                 contentRect: screen.frame, styleMask: [.borderless],
                 backing: .buffered, defer: false, screen: screen)
@@ -1563,15 +1566,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window = NSWindow(
                 contentRect: rect, styleMask: [.titled, .closable, .resizable],
                 backing: .buffered, defer: false)
-            window.title = "PSVR2 Player (предпросмотр)"
+            window.title = "PSVR2 Player (preview)"
             window.contentView = view
             window.makeKeyAndOrderFront(nil)
             window.makeFirstResponder(view)
         }
         NSApp.activate(ignoringOtherApps: true)
 
-        // Подстраховка: ловим клавиши на уровне приложения, даже если окно
-        // на дисплее шлема не в фокусе
+        // Safety net: catch keys at the application level even if the window
+        // on the headset display is not focused
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             view.keyDown(with: event)
             return nil
@@ -1581,13 +1584,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return nil
         }
 
-        // Пейсинг от конкретного дисплея шлема через CVDisplayLink:
-        // CADisplayLink/MTKView могут тикать от другого (60 Гц) экрана
+        // Pacing from the specific headset display via CVDisplayLink:
+        // CADisplayLink/MTKView may tick from another (60 Hz) screen
         let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber
         let displayID = CGDirectDisplayID(truncating: screenNumber)
         if let mode = CGDisplayCopyDisplayMode(displayID) {
-            print("[display] Частота дисплея шлема по CoreGraphics: \(mode.refreshRate) Гц, "
-                + "maxFPS экрана: \(screen.maximumFramesPerSecond)")
+            print("[display] Headset display refresh rate per CoreGraphics: \(mode.refreshRate) Hz, "
+                + "screen maxFPS: \(screen.maximumFramesPerSecond)")
         }
         if vrScreen != nil {
             startWindowSweeper(vrScreen: screen)
@@ -1605,23 +1608,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             CVDisplayLinkStart(link)
             cvLink = link
         } else {
-            print("[display] !!! CVDisplayLink не создался — падаю обратно на таймер MTKView")
+            print("[display] !!! CVDisplayLink failed to create — falling back to the MTKView timer")
             view.isPaused = false
         }
 
-        // Без файла — сразу открываем выбор в шлеме
+        // No file — open the picker in the headset right away
         if videoURL == nil {
             overlay.openPicker()
         }
 
-        print("[player] Управление: Space пауза · R или кнопка Fn шлема — рецентр · F проекция · G стерео · V флип")
-        print("[player]             ←/→ ±15с · ↑/↓ громкость · +/- FOV fisheye · Q выход")
-        print("[player]             отладка: P предсказание · [/] упреждение · S развёртка · C хроматика")
+        print("[player] Controls: Space pause · R or headset Fn button — recenter · F projection · G stereo · V flip")
+        print("[player]           ←/→ ±15s · ↑/↓ volume · +/- fisheye FOV · Q quit")
+        print("[player]           debug: P prediction · [/] lookahead · S scanout · C chromatic")
     }
 
-    // Окно-пульт на обычном мониторе: таблица «настройка — значение —
-    // клавиша» по группам, как в типичных настройках приложения. Заодно
-    // держит клавиатурный фокус, чтобы системные диалоги были видны
+    // Remote window on the regular monitor: a "setting — value — key" table
+    // grouped like typical app preferences. It also holds keyboard focus so
+    // system dialogs stay visible
     private func makeControlWindow() {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
@@ -1635,9 +1638,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let win = NSWindow(
             contentRect: frame, styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false, screen: deskScreen)
-        win.title = "PSVR2 Player — пульт"
+        win.title = "GAV PSVR2 Player — Remote"
         win.isReleasedWhenClosed = false
-        // Крестик пульта закрывает весь плеер — как клавиша Q
+        // The remote's close button quits the whole player — same as the Q key
         NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification, object: win, queue: .main) { _ in
             NSApp.terminate(nil)
@@ -1660,7 +1663,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controlValues.removeAll()
 
         func addHeader(_ title: String) {
-            // Строка обязана иметь все 3 ячейки, иначе mergeCells падает
+            // The row must have all 3 cells, otherwise mergeCells crashes
             let row = grid.addRow(with: [
                 label(title, size: 12, color: .secondaryLabelColor, weight: .semibold),
                 NSGridCell.emptyContentView,
@@ -1680,27 +1683,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controlValues[id] = value
         }
 
-        addHeader("Воспроизведение")
-        addRow("Файл", id: "file", key: "")
-        addRow("Позиция", id: "pos", key: "Space · ←/→")
-        addRow("Громкость", id: "vol", key: "↑/↓")
-        addRow("Скорость", id: "rate", key: "панель в шлеме")
-        addHeader("Изображение")
-        addRow("Проекция", id: "proj", key: "F")
-        addRow("Стерео", id: "stereo", key: "G")
-        addRow("Флип по вертикали", id: "flip", key: "V")
-        addRow("FOV fisheye", id: "fov", key: "+ / −")
-        addHeader("Камеры (вид вокруг)")
-        addRow("Режим", id: "pt", key: "B · двойное Fn")
-        addRow("Стерео/моно", id: "ptmode", key: "M")
-        addRow("Сведение", id: "ptconv", key: ", / .")
-        addRow("Угол объектива", id: "ptfov", key: "+ / −")
-        addHeader("Шлем и трекинг")
-        addRow("Трекинг", id: "track", key: "")
-        addRow("Предсказание позы", id: "pred", key: "P")
-        addRow("Упреждение", id: "look", key: "[ / ]")
-        addRow("Коррекция развёртки", id: "scan", key: "S")
-        addRow("Хроматика", id: "chrom", key: "C")
+        addHeader("Playback")
+        addRow("File", id: "file", key: "")
+        addRow("Position", id: "pos", key: "Space · ←/→")
+        addRow("Volume", id: "vol", key: "↑/↓")
+        addRow("Speed", id: "rate", key: "panel in headset")
+        addHeader("Image")
+        addRow("Projection", id: "proj", key: "F")
+        addRow("Stereo", id: "stereo", key: "G")
+        addRow("Vertical flip", id: "flip", key: "V")
+        addRow("Fisheye FOV", id: "fov", key: "+ / −")
+        addHeader("Cameras (passthrough)")
+        addRow("Mode", id: "pt", key: "B · double Fn")
+        addRow("Stereo/mono", id: "ptmode", key: "M")
+        addRow("Convergence", id: "ptconv", key: ", / .")
+        addRow("Lens angle", id: "ptfov", key: "+ / −")
+        addHeader("Headset and tracking")
+        addRow("Tracking", id: "track", key: "")
+        addRow("Pose prediction", id: "pred", key: "P")
+        addRow("Lookahead", id: "look", key: "[ / ]")
+        addRow("Scanout correction", id: "scan", key: "S")
+        addRow("Chromatic", id: "chrom", key: "C")
         addRow("Vsync", id: "vsync", key: "D")
 
         grid.column(at: 0).width = 150
@@ -1708,10 +1711,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         grid.column(at: 2).xPlacement = .trailing
 
         let footer = NSTextField(wrappingLabelWithString:
-            "Кнопка Fn: одиночное — рецентр · двойное — вид с камер · долгое — центр по взгляду\n"
-            + "Мышь: движение — панель · клик — выбор · ПКМ с ведением — наклон сцены · колесо — список\n"
-            + "Тачпад: то же самое — два пальца листают список, нажатие двумя пальцами "
-            + "с ведением наклоняет сцену")
+            "Fn button: single — recenter · double — camera view · long — center on gaze\n"
+            + "Mouse: move — panel · click — select · right-drag — tilt scene · wheel — file list\n"
+            + "Touchpad: same — two fingers scroll the list, a two-finger press "
+            + "with a drag tilts the scene")
         footer.font = .systemFont(ofSize: 11.5)
         footer.textColor = .tertiaryLabelColor
 
@@ -1745,7 +1748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : String(format: "%d:%02d", s / 60, s % 60)
     }
 
-    // Текущие значения всех настроек — раз в секунду в пульт
+    // Current values of all settings — pushed to the remote once a second
     private func updateControlStatus() {
         guard let r = renderer, !controlValues.isEmpty else { return }
         func set(_ id: String, _ text: String) {
@@ -1759,11 +1762,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 pos = Self.timeText(v.player.currentTime().seconds)
                 dur = Self.timeText(item.duration.seconds)
             }
-            set("pos", "\(pos) / \(dur) · \(v.player.rate == 0 ? "пауза" : "играет")")
-            set("vol", v.deviceVolume().map { "\(Int($0 * 100))% (шлем)" }
+            set("pos", "\(pos) / \(dur) · \(v.player.rate == 0 ? "paused" : "playing")")
+            set("vol", v.deviceVolume().map { "\(Int($0 * 100))% (headset)" }
                 ?? "\(Int(v.player.volume * 100))%")
         } else {
-            set("file", "не открыт")
+            set("file", "not open")
             set("pos", "—")
             set("vol", "—")
         }
@@ -1772,30 +1775,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cfg = r.config
         set("proj", cfg.projection.label)
         set("stereo", cfg.stereo.label)
-        set("flip", cfg.flipV < 0 ? "вкл" : "выкл")
+        set("flip", cfg.flipV < 0 ? "on" : "off")
         set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
 
         if let pt = r.passthrough {
-            set("pt", pt.active ? "включены" : (pt.available ? "выключены" : "недоступны"))
+            set("pt", pt.active ? "on" : (pt.available ? "off" : "unavailable"))
             set("ptmode", pt.source.label)
             set("ptconv", String(format: "%+.3f", pt.convergence))
             set("ptfov", "\(Int(pt.fovDeg))°")
         }
 
-        set("track", r.tracker.connected ? "есть" : "НЕТ")
-        set("pred", r.tracker.predictionEnabled ? "вкл" : "выкл")
-        set("look", "\(Int(r.tracker.extraLookaheadS * 1000)) мс")
-        set("scan", r.scanlineEnabled ? "вкл" : "выкл")
-        set("chrom", r.chromaticEnabled ? "вкл" : "выкл")
+        set("track", r.tracker.connected ? "yes" : "NO")
+        set("pred", r.tracker.predictionEnabled ? "on" : "off")
+        set("look", "\(Int(r.tracker.extraLookaheadS * 1000)) ms")
+        set("scan", r.scanlineEnabled ? "on" : "off")
+        set("chrom", r.chromaticEnabled ? "on" : "off")
         set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)
-            ? "вкл" : "выкл")
+            ? "on" : "off")
     }
 
-    // Сторож: чужие окна, попавшие на дисплей шлема, переносим на монитор
+    // Watchdog: foreign windows that land on the headset display are moved to the monitor
     private func startWindowSweeper(vrScreen: NSScreen) {
         let deskScreen = NSScreen.screens.first { $0 != vrScreen } ?? vrScreen
         guard deskScreen != vrScreen else { return }
-        // NSScreen (y вверх от низа главного экрана) -> CG (y вниз от верха)
+        // NSScreen (y up from the bottom of the main screen) -> CG (y down from the top)
         let primaryHeight = NSScreen.screens[0].frame.height
         func cgRect(_ f: NSRect) -> CGRect {
             CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
@@ -1804,22 +1807,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             vrFrame: cgRect(vrScreen.frame), targetFrame: cgRect(deskScreen.frame))
         sweeper.onStray = { [weak self] name, moved in
             if moved {
-                self?.renderer.overlay?.showOSD("Окно «\(name)» перенесено на монитор", duration: 4)
-                print("[sweeper] окно «\(name)» перенесено с экрана шлема на монитор")
+                self?.renderer.overlay?.showOSD("Window \"\(name)\" moved to the monitor", duration: 4)
+                print("[sweeper] window \"\(name)\" moved from the headset screen to the monitor")
             } else {
                 self?.renderer.overlay?.showOSD(
-                    "Окно «\(name)» открылось на экране шлема (см. лог)", duration: 6)
-                print("[sweeper] Окно «\(name)» на экране шлема. Для автопереноса дайте доступ:")
-                print("[sweeper] Настройки → Конфиденциальность → Универсальный доступ → «+» → PSVR2Player.app")
+                    "Window \"\(name)\" opened on the headset screen (see log)", duration: 6)
+                print("[sweeper] Window \"\(name)\" is on the headset screen. For auto-move, grant access:")
+                print("[sweeper] Settings → Privacy & Security → Accessibility → \"+\" → PSVR2Player.app")
             }
         }
         sweeper.start()
         self.sweeper = sweeper
     }
 
-    // Системный запрос доступа macOS показывает на экране активного окна.
-    // Наше окно — в шлеме, поэтому на время ожидания открываем окно-подсказку
-    // на обычном мониторе: диалог появится там же.
+    // macOS shows the system access prompt on the active window's screen.
+    // Our window is in the headset, so while waiting we open a helper window
+    // on the regular monitor: the dialog will appear there too.
     private func showAccessHelper() {
         window.level = .normal
         guard accessHelperWindow == nil else { return }
@@ -1835,20 +1838,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let helper = NSWindow(
             contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false,
             screen: deskScreen)
-        helper.title = "PSVR2 Player — доступ к диску"
+        helper.title = "GAV PSVR2 Player — Disk Access"
         helper.level = .floating
 
         let label = NSTextField(wrappingLabelWithString:
-            "Ожидание доступа к диску.\n\n"
-            + "Разрешите доступ в системном запросе, если он появился. "
-            + "Если запроса нет — нажмите кнопку ниже: откроются «Полный доступ к диску» "
-            + "и папка с приложением. Добавьте PSVR2Player.app кнопкой «+» и включите "
-            + "переключатель, затем повторите выбор диска.")
+            "Waiting for disk access.\n\n"
+            + "Allow access in the system prompt if it appeared. "
+            + "If there is no prompt, press the button below: \"Full Disk Access\" "
+            + "and the app folder will open. Add PSVR2Player.app with the \"+\" button, "
+            + "enable the toggle, then pick the disk again.")
         label.frame = NSRect(x: 20, y: 60, width: size.width - 40, height: size.height - 76)
         label.font = .systemFont(ofSize: 13)
         helper.contentView?.addSubview(label)
 
-        let button = NSButton(title: "Открыть настройки доступа", target: self,
+        let button = NSButton(title: "Open access settings", target: self,
                               action: #selector(openFullDiskAccess))
         button.frame = NSRect(x: 20, y: 16, width: 240, height: 32)
         button.bezelStyle = .rounded
@@ -1857,7 +1860,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         helper.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         accessHelperWindow = helper
-        print("[player] Открыто окно ожидания доступа на мониторе")
+        print("[player] Access-waiting window opened on the monitor")
     }
 
     @objc private func openFullDiskAccess() {
@@ -1866,7 +1869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.open(url)
         }
         NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-        print("[player] Полный доступ к диску → «+» → \(Bundle.main.bundleURL.path)")
+        print("[player] Full Disk Access → \"+\" → \(Bundle.main.bundleURL.path)")
     }
 
     private func hideAccessHelper() {
@@ -1894,16 +1897,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             renderer?.overlay?.showOSD(message, duration: 8)
         }
         vs.routeAudioToHeadset()
-        // Восстанавливаем сохранённую громкость
+        // Restore the saved volume
         if let saved = UserDefaults.standard.object(forKey: "volume") as? Float {
             vs.player.volume = max(0, min(1, saved))
         }
         renderer.video = vs
         renderer.overlay?.setCurrentFile(url)
         renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
-        renderer.playbackRate = 1.0 // скорость — ситуативная, новый файл с 1×
+        renderer.playbackRate = 1.0 // rate is situational; a new file starts at 1×
 
-        // Продолжаем с прошлого места, если файл уже смотрели
+        // Resume from the last position if the file was watched before
         if let resume = ResumeStore.position(for: url), resume > 15 {
             vs.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600),
                            toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
@@ -1911,14 +1914,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let ts = s >= 3600
                 ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
                 : String(format: "%d:%02d", s / 60, s % 60)
-            renderer.overlay?.showOSD("Продолжаю с \(ts)", duration: 3)
-            print("[player] продолжаю с \(ts)")
+            renderer.overlay?.showOSD("Resuming from \(ts)", duration: 3)
+            print("[player] resuming from \(ts)")
         }
 
         vs.player.rate = renderer.playbackRate
         let config = renderer.config
-        print("[player] Файл: \(url.lastPathComponent)")
-        print("[player] Проекция: \(config.projection.label), \(config.stereo.label)"
+        print("[player] File: \(url.lastPathComponent)")
+        print("[player] Projection: \(config.projection.label), \(config.stereo.label)"
             + (config.projection == .fisheye ? ", FOV \(config.fisheyeFovDeg)°" : ""))
     }
 
@@ -1932,24 +1935,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - Запуск
+// MARK: - Startup
 
 setbuf(stdout, nil)
 setbuf(stderr, nil)
 
-// Запуск из Finder/Dock: терминала нет, лог пишем в файл.
-// Смотреть: tail -f ~/Library/Logs/PSVR2Player.log или приложение «Консоль»
+// Launched from Finder/Dock: no terminal, so write the log to a file.
+// Watch it: tail -f ~/Library/Logs/PSVR2Player.log or the Console app
 if isatty(STDOUT_FILENO) == 0 {
     let logPath = ("~/Library/Logs/PSVR2Player.log" as NSString).expandingTildeInPath
     freopen(logPath, "w", stdout)
     freopen(logPath, "a", stderr)
     setbuf(stdout, nil)
     setbuf(stderr, nil)
-    print("[player] Запуск \(Date()); лог: \(logPath)")
+    print("[player] Started \(Date()); log: \(logPath)")
 }
 
 let args = CommandLine.arguments
-// Без аргумента файл выбирается панелью в шлеме после запуска
+// With no argument, the file is chosen via the in-headset panel after launch
 let url: URL? = args.count > 1 ? URL(fileURLWithPath: args[1]) : nil
 
 let app = NSApplication.shared

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""Мгновенная правка тега hev1 → hvc1 прямо в файле (4 байта).
+"""Instant in-place hev1 → hvc1 tag fix (4 bytes).
 
-Зачем: macOS/AVFoundation не декодирует HEVC с тегом hev1, хотя во многих
-таких файлах параметры кодека (VPS/SPS/PPS) уже лежат в заголовке дорожки
-(бокс hvcC) — то есть содержимое полностью соответствует hvc1, неверен только
-тег. В этом случае перепаковка не нужна: правим 4 байта и файл открывается.
+Why: macOS/AVFoundation does not decode HEVC tagged hev1, even though in many
+such files the codec parameters (VPS/SPS/PPS) already sit in the track header
+(the hvcC box) — i.e. the content fully matches hvc1 and only the tag is
+wrong. In that case no remuxing is needed: patch 4 bytes and the file opens.
 
-Данные видео не трогаются: меняется единственное поле в заголовке, поэтому
-операция занимает миллисекунды даже для файла на 50 ГБ, лежащего на HDD.
+The video data is untouched: a single header field changes, so the operation
+takes milliseconds even for a 50 GB file sitting on an HDD.
 
-Если параметров в заголовке нет (редкий случай), файл пропускается — для него
-нужна полная перепаковка утилитой fix-hev1.
+If the header has no parameter sets (rare case), the file is skipped — it
+needs a full remux with the fix-hev1 utility.
 
-Использование:
-    tag-hvc1 -n <файл|папка> ...   показать, что можно исправить (ничего не меняя)
-    tag-hvc1 <файл|папка> ...      исправить
-    tag-hvc1 -r <файл|папка> ...   вернуть обратно hvc1 → hev1
+Usage:
+    tag-hvc1 -n <file|folder> ...   show what can be fixed (changing nothing)
+    tag-hvc1 <file|folder> ...      fix
+    tag-hvc1 -r <file|folder> ...   revert hvc1 → hev1
 """
 
 import os
@@ -27,7 +27,7 @@ CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
 
 
 def find_sample_entries(fh, start, end):
-    """Смещения записей stsd: [(смещение тега, тег, смещение записи, размер)]."""
+    """stsd entry offsets: [(tag offset, tag, entry offset, size)]."""
     entries = []
     fh.seek(start)
     while fh.tell() < end - 8:
@@ -66,29 +66,29 @@ def find_sample_entries(fh, start, end):
 
 
 def hvcc_has_parameter_sets(fh, entry_pos, entry_size):
-    """Есть ли в hvcC наборы параметров SPS и PPS."""
+    """Whether the hvcC box contains SPS and PPS parameter sets."""
     fh.seek(entry_pos)
     data = fh.read(entry_size)
     idx = data.find(b"hvcC")
     if idx < 0:
-        return False, "нет бокса hvcC"
+        return False, "no hvcC box"
 
     box = data[idx + 4:]
     if len(box) < 23:
-        return False, "hvcC обрезан"
+        return False, "hvcC truncated"
 
     num_arrays = box[22]
     p = 23
     kinds = set()
     for _ in range(num_arrays):
         if p + 3 > len(box):
-            return False, "hvcC повреждён"
+            return False, "hvcC corrupted"
         nal_type = box[p] & 0x3F
         count = struct.unpack(">H", box[p + 1:p + 3])[0]
         p += 3
         for _ in range(count):
             if p + 2 > len(box):
-                return False, "hvcC повреждён"
+                return False, "hvcC corrupted"
             length = struct.unpack(">H", box[p:p + 2])[0]
             p += 2 + length
         if count:
@@ -97,7 +97,7 @@ def hvcc_has_parameter_sets(fh, entry_pos, entry_size):
     if 33 in kinds and 34 in kinds:
         names = {32: "VPS", 33: "SPS", 34: "PPS"}
         return True, ", ".join(names.get(k, str(k)) for k in sorted(kinds))
-    return False, "в hvcC нет SPS/PPS"
+    return False, "no SPS/PPS in hvcC"
 
 
 def process(path, dry_run, revert):
@@ -109,7 +109,7 @@ def process(path, dry_run, revert):
         try:
             entries = find_sample_entries(fh, 0, size)
         except (struct.error, OSError) as exc:
-            print(f"  ! {os.path.basename(path)}: не разобрать ({exc})")
+            print(f"  ! {os.path.basename(path)}: cannot parse ({exc})")
             return 0
 
         targets = []
@@ -118,7 +118,7 @@ def process(path, dry_run, revert):
                 continue
             ok, detail = hvcc_has_parameter_sets(fh, epos, esize)
             if not ok and not revert:
-                print(f"  · {os.path.basename(path)}: {detail} — нужна перепаковка "
+                print(f"  · {os.path.basename(path)}: {detail} — needs remuxing "
                       f"(tools/fix-hev1)")
                 continue
             targets.append((tag_off, detail))
@@ -128,7 +128,7 @@ def process(path, dry_run, revert):
 
     detail = targets[0][1]
     if dry_run:
-        print(f"  → {os.path.basename(path)}: можно исправить ({detail})")
+        print(f"  → {os.path.basename(path)}: can be fixed ({detail})")
         return len(targets)
 
     with open(path, "r+b") as fh:
@@ -163,7 +163,7 @@ def main():
         return 1
 
     files = collect(paths)
-    print(f"Проверяю файлов: {len(files)}")
+    print(f"Checking files: {len(files)}")
 
     fixed = 0
     for path in files:
@@ -173,9 +173,9 @@ def main():
             print(f"  ! {os.path.basename(path)}: {exc}")
 
     if dry_run:
-        print(f"Можно исправить дорожек: {fixed}")
+        print(f"Tracks that can be fixed: {fixed}")
     else:
-        print(f"Исправлено дорожек: {fixed}")
+        print(f"Tracks fixed: {fixed}")
     return 0
 
 

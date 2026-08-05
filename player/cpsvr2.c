@@ -1,6 +1,6 @@
 /*
- * Чтение поз PSVR2 через libusb. Протокол задокументирован в драйвере
- * Monado (BSL-1.0): src/xrt/drivers/psvr2.
+ * PSVR2 pose reading via libusb. The protocol is documented in the
+ * Monado driver (BSL-1.0): src/xrt/drivers/psvr2.
  */
 #include "cpsvr2.h"
 
@@ -22,7 +22,7 @@
 #define STATUS_ENDPOINT 0x88
 #define CAMERA_INTERFACE 6
 #define CAMERA_ENDPOINT 0x87
-/* Заголовок кадра камер ('V','I'), дальше две BC4-плоскости */
+/* Camera frame header ('V','I'), followed by two BC4 planes */
 #define CAMERA_HEADER_BYTES 256
 
 #define GYRO_SCALE (2000.0f / 32767.0f)
@@ -83,16 +83,16 @@ static int g_proximity;
 static int g_function_button;
 static int g_ipd_mm = 63;
 
-/* Камеры: свой мьютекс — копирование кадра (1 МБ) не должно задерживать
- * чтение позы и IMU под общим g_lock */
+/* Cameras: separate mutex — copying a frame (1 MB) must not delay
+ * pose and IMU reads under the shared g_lock */
 static pthread_mutex_t g_camera_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_camera_thread;
 static volatile int g_camera_running;
-static unsigned char *g_camera_frame; /* две BC4-плоскости подряд */
-static int g_camera_seq;              /* растёт с каждым принятым кадром */
+static unsigned char *g_camera_frame; /* two BC4 planes back to back */
+static int g_camera_seq;              /* grows with every received frame */
 static int g_camera_seq_taken;
 
-/* Кольцевой буфер IMU: ~130 мс истории при 2000 Гц */
+/* IMU ring buffer: ~130 ms of history at 2000 Hz */
 #define IMU_RING_SIZE 256
 #define IMU_DT 0.0005f
 struct imu_sample {
@@ -100,10 +100,10 @@ struct imu_sample {
 	float gyro[3];
 };
 static struct imu_sample g_imu_ring[IMU_RING_SIZE];
-static int g_imu_head; /* индекс следующей записи */
+static int g_imu_head; /* index of the next write */
 static int g_imu_count;
 
-/* Кватернионы в порядке w,x,y,z */
+/* Quaternions in w,x,y,z order */
 static void quat_mul(const float a[4], const float b[4], float out[4])
 {
 	float w = a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3];
@@ -116,7 +116,7 @@ static void quat_mul(const float a[4], const float b[4], float out[4])
 	out[3] = z;
 }
 
-/* Поворот на вектор угловой скорости за dt (экспонента кватерниона) */
+/* Rotation by the angular-velocity vector over dt (quaternion exponential) */
 static void quat_from_gyro(const float gyro[3], float dt, float out[4])
 {
 	float hx = gyro[0] * dt * 0.5f;
@@ -169,7 +169,7 @@ static void *slam_thread_fn(void *arg)
 		memcpy(&rec, buf, sizeof(rec));
 
 		pthread_mutex_lock(&g_lock);
-		/* Непрерывность кватерниона: выбираем ближайший из q/-q */
+		/* Quaternion continuity: pick the closer of q/-q */
 		float dot = g_quat[0] * rec.orient[0] + g_quat[1] * rec.orient[1] +
 		            g_quat[2] * rec.orient[2] + g_quat[3] * rec.orient[3];
 		float sign = (g_have_pose && dot < 0.0f) ? -1.0f : 1.0f;
@@ -214,7 +214,7 @@ static void *status_thread_fn(void *arg)
 			struct imu_usb_record imu;
 			memcpy(&imu, buf + sizeof(*hdr) + i * sizeof(imu), sizeof(imu));
 
-			/* Маппинг осей как в Monado process_imu_record */
+			/* Axis mapping as in Monado process_imu_record */
 			struct imu_sample *s = &g_imu_ring[g_imu_head];
 			s->vts_us = imu.vts_us;
 			s->gyro[0] = -DEG_TO_RAD(imu.gyro[1] * GYRO_SCALE);
@@ -293,7 +293,7 @@ int psvr2_get_distortion_calibration(float out[8])
 	float p[8];
 	memcpy(p, buf + 8, sizeof(p));
 
-	/* Преобразование из psvr2_setup_distortion_and_fovs (Monado) */
+	/* Conversion from psvr2_setup_distortion_and_fovs (Monado) */
 	if (version < 4) {
 		out[0] = -0.09919293f;
 		out[2] = 0.09919293f;
@@ -328,7 +328,7 @@ int psvr2_start(void)
 
 	g_dev = libusb_open_device_with_vid_pid(g_ctx, PSVR2_VID, PSVR2_PID);
 	if (g_dev == NULL) {
-		fprintf(stderr, "psvr2: устройство %04x:%04x не найдено\n", PSVR2_VID, PSVR2_PID);
+		fprintf(stderr, "psvr2: device %04x:%04x not found\n", PSVR2_VID, PSVR2_PID);
 		libusb_exit(g_ctx);
 		g_ctx = NULL;
 		return -1;
@@ -342,7 +342,7 @@ int psvr2_start(void)
 		ret = libusb_claim_interface(g_dev, SLAM_INTERFACE);
 	}
 	if (ret != 0) {
-		fprintf(stderr, "psvr2: не удалось захватить интерфейсы: %s\n", libusb_error_name(ret));
+		fprintf(stderr, "psvr2: failed to claim interfaces: %s\n", libusb_error_name(ret));
 		libusb_close(g_dev);
 		g_dev = NULL;
 		libusb_exit(g_ctx);
@@ -362,8 +362,8 @@ void psvr2_stop(void)
 	if (!g_running) {
 		return;
 	}
-	/* Поток камер работает с g_dev — глушим его до закрытия устройства,
-	 * заодно выключаем камеры в шлеме */
+	/* The camera thread uses g_dev — shut it down before closing the device,
+	 * also powering off the headset cameras */
 	psvr2_camera_stop();
 	g_running = 0;
 	pthread_join(g_slam_thread, NULL);
@@ -418,8 +418,8 @@ int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 		return 0;
 	}
 
-	/* Интегрируем IMU-сэмплы новее SLAM-позы (общая шкала VTS, мкс).
-	 * Беззнаковое вычитание корректно при переполнении счётчика. */
+	/* Integrate IMU samples newer than the SLAM pose (shared VTS timescale, us).
+	 * Unsigned subtraction handles counter wraparound correctly. */
 	float delta[4] = {1, 0, 0, 0};
 	int idx = (g_imu_head - g_imu_count + IMU_RING_SIZE) % IMU_RING_SIZE;
 	for (int n = 0; n < g_imu_count; n++) {
@@ -433,7 +433,7 @@ int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 		quat_mul(delta, dq, delta);
 	}
 
-	/* Остаток: от последнего IMU-сэмпла до текущего кадра + упреждение */
+	/* Remainder: from the last IMU sample to the current frame + lookahead */
 	double tail = monotonic_s() - g_imu_time + (double)lookahead_s;
 	if (tail < 0.0) tail = 0.0;
 	if (tail > 0.1) tail = 0.1;
@@ -441,8 +441,8 @@ int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 	quat_from_gyro(g_gyro, (float)tail, dq);
 	quat_mul(delta, dq, delta);
 
-	/* Дельта интегрирована в осях Monado-маппинга — приводим SLAM-кватернион
-	 * к тем же осям (как в process_slam_record) и лишь потом умножаем */
+	/* The delta is integrated in Monado-mapped axes — bring the SLAM quaternion
+	 * into the same axes (as in process_slam_record) before multiplying */
 	float mapped[4] = {g_quat[0], -g_quat[2], -g_quat[1], g_quat[3]};
 	quat_mul(mapped, delta, out_wxyz);
 
@@ -465,11 +465,11 @@ int psvr2_get_button(void)
 	return b;
 }
 
-/* --- Камеры шлема (passthrough) ---
- * Протокол из PSVR2Toolkit (https://github.com/BnuuySolutions/PSVR2Toolkit):
- * камеры включаются vendor-командой 0x0B, кадры идут пакетами 'V','I'
- * (заголовок 256 байт + две BC4-плоскости). Команда «не прилипает»:
- * шлём её после захвата интерфейса и повторяем при простое потока.
+/* --- Headset cameras (passthrough) ---
+ * Protocol from PSVR2Toolkit (https://github.com/BnuuySolutions/PSVR2Toolkit):
+ * cameras are enabled with vendor command 0x0B, frames arrive as 'V','I'
+ * packets (256-byte header + two BC4 planes). The command does not "stick":
+ * send it after claiming the interface and repeat it when the stream idles.
  */
 
 static int camera_power(int on)
@@ -492,7 +492,7 @@ static void *camera_thread_fn(void *arg)
 		int ret = libusb_bulk_transfer(g_dev, CAMERA_ENDPOINT, buf,
 		                               frame_bytes + 4096, &transferred, 300);
 		if (ret == LIBUSB_ERROR_TIMEOUT) {
-			camera_power(1); /* поток мог заглохнуть — переспрашиваем */
+			camera_power(1); /* the stream may have stalled — re-request it */
 			continue;
 		}
 		if (ret != 0) {
@@ -525,7 +525,7 @@ int psvr2_camera_start(void)
 
 	int ret = libusb_claim_interface(g_dev, CAMERA_INTERFACE);
 	if (ret != 0) {
-		fprintf(stderr, "psvr2: интерфейс камер занят: %s\n", libusb_error_name(ret));
+		fprintf(stderr, "psvr2: camera interface busy: %s\n", libusb_error_name(ret));
 		return -1;
 	}
 
@@ -542,7 +542,7 @@ int psvr2_camera_start(void)
 		return -1;
 	}
 
-	/* Команда включения обязана идти после захвата интерфейса */
+	/* The power-on command must come after claiming the interface */
 	camera_power(1);
 
 	g_camera_running = 1;

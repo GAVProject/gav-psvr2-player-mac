@@ -1,4 +1,4 @@
-# Сборка
+# Build output
 *.o
 player/psvr2player
 player/PSVR2Player.app
@@ -8,11 +8,11 @@ tools/psvr2_gaze
 tools/psvr2_camera
 tools/psvr2_dump
 
-# Артефакты запуска
+# Runtime artifacts
 psvr2_calibration.bin
 tools/psvr2_calibration.bin
 
-# Видеофайлы
+# Video files
 video/
 *.mp4
 *.mov

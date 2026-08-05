@@ -1,18 +1,18 @@
 /*
- * psvr2_camera — попытка получить кадры камер PSVR2 (passthrough) через
- * PC-адаптер и дамп найденного в файл.
+ * psvr2_camera — attempt to get PSVR2 camera frames (passthrough) via the
+ * PC adapter and dump what is found to a file.
  *
- * Протокол из PSVR2Toolkit (BnuuySolutions):
+ * Protocol from PSVR2Toolkit (BnuuySolutions):
  * https://github.com/BnuuySolutions/PSVR2Toolkit
- *   - включение камер: vendor control 0x09, report_id 0x0B,
- *     данные {1,0,0,0, 0x10, 0,0,0} (0x05 вместо 0x10 — выключить)
- *   - кадры: сигнатура 'V','I', заголовок 256 байт,
- *     image_type 11 — passthrough BC4 1024x1016, 6 — картинка глаз
- *   - поток взгляда рядом: report_id 0x0C, интерфейс 5 EP 0x85
+ *   - camera enable: vendor control 0x09, report_id 0x0B,
+ *     data {1,0,0,0, 0x10, 0,0,0} (0x05 instead of 0x10 — disable)
+ *   - frames: signature 'V','I', 256-byte header,
+ *     image_type 11 — passthrough BC4 1024x1016, 6 — eye image
+ *   - gaze stream nearby: report_id 0x0C, interface 5 EP 0x85
  *
- * Команда включения, по опыту Toolkit, «не прилипает» — шлём повторно.
- * Перебираем все интерфейсы, альтернативные настройки и IN-эндпоинты,
- * печатаем сигнатуры всех найденных потоков (не только VI).
+ * Per Toolkit experience, the enable command does not "stick" — resend it.
+ * Iterate over all interfaces, alternate settings and IN endpoints,
+ * print the signatures of every stream found (not just VI).
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -31,7 +31,7 @@ struct image_data_hdr {
 	uint32_t total_size;
 	uint32_t timestamp;
 	uint8_t unk0[4];
-	uint16_t image_type; /* 11 — passthrough, 6 — изображение глаз */
+	uint16_t image_type; /* 11 — passthrough, 6 — eye image */
 	uint8_t unk1[22];
 	uint32_t custom_data_size;
 	uint8_t unk2[20];
@@ -73,7 +73,7 @@ static void camera_power(libusb_device_handle *dev, int on)
 	send_cmd(dev, 0x0B, data, sizeof(data));
 }
 
-/* Слушаем эндпоинт, печатаем встреченные сигнатуры пакетов */
+/* Listen on an endpoint, print the packet signatures encountered */
 static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
                      const char *outPath, int *foundVI)
 {
@@ -103,7 +103,7 @@ static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
 
 		if (buf[0] == 'V' && buf[1] == 'I' && transferred > (int)sizeof(struct image_data_hdr)) {
 			struct image_data_hdr *h = (struct image_data_hdr *)buf;
-			printf("      >>> VI-кадр! тип %u, размер %u, пакет %d байт\n",
+			printf("      >>> VI frame! type %u, size %u, packet %d bytes\n",
 			       h->image_type, h->total_size, transferred);
 			static int saved = 0;
 			if (outPath != NULL && saved < 6) {
@@ -113,7 +113,7 @@ static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
 				if (f != NULL) {
 					fwrite(buf, 1, transferred, f);
 					fclose(f);
-					printf("      >>> кадр %d: %s (hdr %02x %02x %02x %02x %02x %02x)\n",
+					printf("      >>> frame %d: %s (hdr %02x %02x %02x %02x %02x %02x)\n",
 					       saved, path, buf[16], buf[17], buf[18], buf[19], buf[20], buf[21]);
 					saved++;
 				}
@@ -123,7 +123,7 @@ static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
 	}
 
 	if (packets > 0) {
-		printf("      %d пакетов, сигнатуры:", packets);
+		printf("      %d packets, signatures:", packets);
 		for (int s = 0; s < seen_n; s++) {
 			printf(" '%s'", seen[s]);
 		}
@@ -141,19 +141,19 @@ int main(int argc, char **argv)
 	libusb_init(&ctx);
 	libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
 	if (dev == NULL) {
-		fprintf(stderr, "PSVR2 не найден\n");
+		fprintf(stderr, "PSVR2 not found\n");
 		return 1;
 	}
 
-	/* Взгляд и камеры включаем оба: image_type 6 идёт вместе с потоком глаз */
+	/* Enable both gaze and cameras: image_type 6 comes along with the eye stream */
 	send_cmd(dev, 0x0C, NULL, 0);
 	camera_power(dev, 1);
-	printf("Команды включения отправлены (0x0C взгляд, 0x0B камеры)\n\n");
+	printf("Enable commands sent (0x0C gaze, 0x0B cameras)\n\n");
 
 	libusb_device *d = libusb_get_device(dev);
 	struct libusb_config_descriptor *cfg;
 	if (libusb_get_active_config_descriptor(d, &cfg) < 0) {
-		fprintf(stderr, "config descriptor недоступен\n");
+		fprintf(stderr, "config descriptor unavailable\n");
 		return 1;
 	}
 
@@ -172,7 +172,7 @@ int main(int argc, char **argv)
 			if (libusb_set_interface_alt_setting(dev, num, alt->bAlternateSetting) < 0) {
 				continue;
 			}
-			/* Команда «не прилипает»: повторяем на каждой настройке */
+			/* The command does not "stick": repeat on every setting */
 			camera_power(dev, 1);
 			for (int e = 0; e < alt->bNumEndpoints; e++) {
 				const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
@@ -191,8 +191,8 @@ int main(int argc, char **argv)
 	}
 
 	printf("\n%s\n", foundVI
-	    ? "=== КАДРЫ КАМЕР ДОСТУПНЫ ==="
-	    : "=== VI-кадров не найдено ===");
+	    ? "=== CAMERA FRAMES AVAILABLE ==="
+	    : "=== No VI frames found ===");
 
 	camera_power(dev, 0);
 	libusb_free_config_descriptor(cfg);

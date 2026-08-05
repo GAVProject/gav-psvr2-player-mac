@@ -18,15 +18,15 @@ psvr2player: main.swift overlay.swift sweeper.swift meta.swift passthrough.swift
 		-framework AVFoundation -framework CoreAudio -framework CoreVideo \
 		-o psvr2player
 
-# Бандл нужен не только для запуска из Finder: без Info.plist macOS не может
-# показать запрос доступа к внешним дискам, и чтение тома зависает навсегда
+# The bundle is needed for more than launching from Finder: without Info.plist
+# macOS cannot show the external-disk access prompt, and reading the volume hangs forever
 $(APP): psvr2player Info.plist environment.jpg
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp psvr2player $(APP)/Contents/MacOS/psvr2player
 	cp environment.jpg $(APP)/Contents/Resources/environment.jpg
 	codesign --force --deep --sign - $(APP)
-	@echo "Готово: $(APP) — запуск ./play [файл]"
+	@echo "Done: $(APP) — run ./play [file]"
 
 clean:
 	rm -rf psvr2player cpsvr2.o lut.o $(APP)

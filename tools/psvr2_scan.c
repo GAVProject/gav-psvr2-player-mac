@@ -1,15 +1,15 @@
 /*
- * psvr2_scan — разведка USB-интерфейсов PSVR2 через PC-адаптер.
+ * psvr2_scan — reconnaissance of the PSVR2 USB interfaces via the PC adapter.
  *
- * Вопрос: отдаёт ли адаптер что-то кроме известного (SLAM на intf 3,
- * статус/IMU на intf 7) — например, потоки камер или айтрекинг.
+ * Question: does the adapter expose anything beyond the known streams (SLAM on
+ * intf 3, status/IMU on intf 7) — e.g. camera feeds or eye tracking.
  *
- * Печатает полный конфигурационный дескриптор (интерфейсы, альтернативные
- * настройки, эндпоинты с классами и именами), затем пытается захватить
- * каждый интерфейс и пассивно слушает каждый IN-эндпоинт пару секунд:
- * сколько пакетов, какого размера, первые байты.
+ * Prints the full configuration descriptor (interfaces, alternate settings,
+ * endpoints with classes and names), then tries to claim each interface and
+ * passively listens on each IN endpoint for a couple of seconds:
+ * how many packets, what size, first bytes.
  *
- * Запускать при закрытом плеере (иначе интерфейсы 3 и 7 заняты).
+ * Run with the player closed (otherwise interfaces 3 and 7 are busy).
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -46,8 +46,8 @@ static void listen_endpoint(libusb_device_handle *dev,
 		return;
 	}
 	if (type == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS) {
-		printf("    EP 0x%02x isoc: пассивно не слушаем (нужен async API) — "
-		       "но само наличие изохронного IN намекает на потоковые данные!\n",
+		printf("    EP 0x%02x isoc: not listening passively (needs async API) — "
+		       "but the mere presence of an isochronous IN hints at streaming data!\n",
 		       ep->bEndpointAddress);
 		return;
 	}
@@ -74,7 +74,7 @@ static void listen_endpoint(libusb_device_handle *dev,
 			continue;
 		}
 		if (ret != 0) {
-			printf("    EP 0x%02x %s: ошибка чтения %s\n",
+			printf("    EP 0x%02x %s: read error %s\n",
 			       ep->bEndpointAddress, type_name(type), libusb_error_name(ret));
 			err = 1;
 			break;
@@ -93,11 +93,11 @@ static void listen_endpoint(libusb_device_handle *dev,
 		return;
 	}
 	if (packets == 0) {
-		printf("    EP 0x%02x %s: тишина за 2 с\n",
+		printf("    EP 0x%02x %s: silence for 2 s\n",
 		       ep->bEndpointAddress, type_name(type));
 		return;
 	}
-	printf("    EP 0x%02x %s: %d пакетов, %lld байт (~%.0f КБ/с), первые байты:",
+	printf("    EP 0x%02x %s: %d packets, %lld bytes (~%.0f KB/s), first bytes:",
 	       ep->bEndpointAddress, type_name(type), packets, bytes,
 	       bytes / 2.0 / 1024.0);
 	for (int i = 0; i < first_len; i++) {
@@ -117,7 +117,7 @@ int main(void)
 
 	libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
 	if (dev == NULL) {
-		fprintf(stderr, "PSVR2 (%04x:%04x) не найден. Подключён ли USB адаптера?\n",
+		fprintf(stderr, "PSVR2 (%04x:%04x) not found. Is the adapter's USB plugged in?\n",
 		        PSVR2_VID, PSVR2_PID);
 		return 1;
 	}
@@ -126,10 +126,10 @@ int main(void)
 	struct libusb_device_descriptor dd;
 	libusb_get_device_descriptor(d, &dd);
 
-	static const char *speeds[] = {"?", "1.5 Мбит", "12 Мбит", "480 Мбит",
-	                               "5 Гбит", "10 Гбит", "20 Гбит"};
+	static const char *speeds[] = {"?", "1.5 Mbit", "12 Mbit", "480 Mbit",
+	                               "5 Gbit", "10 Gbit", "20 Gbit"};
 	int sp = libusb_get_device_speed(d);
-	printf("Устройство %04x:%04x, USB-скорость: %s\n", dd.idVendor, dd.idProduct,
+	printf("Device %04x:%04x, USB speed: %s\n", dd.idVendor, dd.idProduct,
 	       (sp >= 0 && sp <= 6) ? speeds[sp] : "?");
 
 	struct libusb_config_descriptor *cfg;
@@ -138,9 +138,9 @@ int main(void)
 		fprintf(stderr, "config descriptor: %s\n", libusb_error_name(ret));
 		return 1;
 	}
-	printf("Интерфейсов в активной конфигурации: %d\n\n", cfg->bNumInterfaces);
+	printf("Interfaces in active configuration: %d\n\n", cfg->bNumInterfaces);
 
-	/* Полная карта дескрипторов */
+	/* Full descriptor map */
 	for (int i = 0; i < cfg->bNumInterfaces; i++) {
 		const struct libusb_interface *itf = &cfg->interface[i];
 		for (int a = 0; a < itf->num_altsetting; a++) {
@@ -150,7 +150,7 @@ int main(void)
 				libusb_get_string_descriptor_ascii(
 				    dev, alt->iInterface, (unsigned char *)name, sizeof(name));
 			}
-			printf("intf %2d alt %d  класс %02x/%02x/%02x  эндпоинтов %d  %s\n",
+			printf("intf %2d alt %d  class %02x/%02x/%02x  endpoints %d  %s\n",
 			       alt->bInterfaceNumber, alt->bAlternateSetting,
 			       alt->bInterfaceClass, alt->bInterfaceSubClass,
 			       alt->bInterfaceProtocol, alt->bNumEndpoints, name);
@@ -165,14 +165,14 @@ int main(void)
 		}
 	}
 
-	/* Прослушка: захватываем интерфейсы по одному и слушаем их IN-эндпоинты */
-	printf("\n=== Прослушка IN-эндпоинтов (по 2 с) ===\n");
+	/* Listening pass: claim interfaces one by one and listen on their IN endpoints */
+	printf("\n=== Listening on IN endpoints (2 s each) ===\n");
 	for (int i = 0; i < cfg->bNumInterfaces; i++) {
 		const struct libusb_interface *itf = &cfg->interface[i];
 		int num = itf->altsetting[0].bInterfaceNumber;
 		ret = libusb_claim_interface(dev, num);
 		if (ret < 0) {
-			printf("intf %2d: захватить не удалось (%s) — возможно, занят системой\n",
+			printf("intf %2d: claim failed (%s) — possibly held by the system\n",
 			       num, libusb_error_name(ret));
 			continue;
 		}
@@ -184,7 +184,7 @@ int main(void)
 			if (alt->bAlternateSetting != 0) {
 				ret = libusb_set_interface_alt_setting(dev, num, alt->bAlternateSetting);
 				if (ret < 0) {
-					printf("intf %2d alt %d: не включился (%s)\n",
+					printf("intf %2d alt %d: failed to activate (%s)\n",
 					       num, alt->bAlternateSetting, libusb_error_name(ret));
 					continue;
 				}
@@ -200,6 +200,6 @@ int main(void)
 	libusb_free_config_descriptor(cfg);
 	libusb_close(dev);
 	libusb_exit(ctx);
-	printf("\nГотово.\n");
+	printf("\nDone.\n");
 	return 0;
 }

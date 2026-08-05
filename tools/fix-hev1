@@ -1,24 +1,25 @@
 #!/bin/zsh
-# Перепаковка HEVC-видео из тега hev1 в hvc1.
+# Remux HEVC video from the hev1 tag to hvc1.
 #
-# AVFoundation (а значит и наш плеер, и QuickTime) не декодирует HEVC с тегом
-# hev1 — параметры кодека лежат внутри потока, а Apple ждёт их в заголовке
-# дорожки. Признак в логе плеера: «hev1 … декодируется: НЕТ».
+# AVFoundation (and therefore our player and QuickTime) does not decode HEVC
+# tagged hev1 — the codec parameters live inside the stream, while Apple
+# expects them in the track header. Sign in the player log:
+# "hev1 … decodable: NO".
 #
-# Перекодирования НЕ происходит: потоки копируются как есть, меняется только
-# тег. Качество не теряется, скорость — как копирование файла.
+# NO transcoding happens: streams are copied as-is, only the tag changes.
+# No quality is lost; speed is like copying the file.
 #
-# Использование:
-#   ./fix-hev1 файл.mp4 [ещё файлы...]
-#   ./fix-hev1 /путь/к/папке        — рекурсивно все mp4/mov/m4v в папке
-#   ./fix-hev1 -n /путь/к/папке     — только показать, что требует перепаковки
+# Usage:
+#   ./fix-hev1 file.mp4 [more files...]
+#   ./fix-hev1 /path/to/folder      — recursively all mp4/mov/m4v in the folder
+#   ./fix-hev1 -n /path/to/folder   — only show what needs remuxing
 #
-# Рядом с исходником появится файл с суффиксом _hvc1.
+# A file with the _hvc1 suffix appears next to the original.
 
 set -u
 
 if ! command -v ffmpeg >/dev/null; then
-	echo "Нужен ffmpeg: brew install ffmpeg" >&2
+	echo "ffmpeg is required: brew install ffmpeg" >&2
 	exit 1
 fi
 
@@ -29,7 +30,7 @@ if [[ "${1:-}" == "-n" ]]; then
 fi
 
 if [[ $# -eq 0 ]]; then
-	echo "Использование: $0 [-n] <файл.mp4 | папка> [...]" >&2
+	echo "Usage: $0 [-n] <file.mp4 | folder> [...]" >&2
 	exit 1
 fi
 
@@ -42,7 +43,7 @@ for arg in "$@"; do
 	fi
 done
 
-echo "Файлов для проверки: ${#files[@]}"
+echo "Files to check: ${#files[@]}"
 if (( dry_run )); then
 	total=0
 	for f in "${files[@]}"; do
@@ -51,11 +52,11 @@ if (( dry_run )); then
 			-of default=nw=1:nk=1 "$f" 2>/dev/null)
 		if [[ "$tag" == "hev1" ]]; then
 			size=$(du -h "$f" | cut -f1)
-			echo "  требует перепаковки ($size): $f"
+			echo "  needs remuxing ($size): $f"
 			(( total++ ))
 		fi
 	done
-	echo "Итого hev1: $total"
+	echo "Total hev1: $total"
 	exit 0
 fi
 
@@ -65,22 +66,22 @@ for f in "${files[@]}"; do
 	tag=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_tag_string \
 		-of default=nw=1:nk=1 "$f" 2>/dev/null)
 	if [[ "$tag" != "hev1" ]]; then
-		echo "· ${f:t} — тег $tag, перепаковка не нужна"
+		echo "· ${f:t} — tag $tag, no remuxing needed"
 		continue
 	fi
 
 	out="${f:r}_hvc1.${f:e}"
 	if [[ -e "$out" ]]; then
-		echo "· ${f:t} — уже есть ${out:t}, пропускаю"
+		echo "· ${f:t} — ${out:t} already exists, skipping"
 		continue
 	fi
 
 	echo "→ ${f:t} → ${out:t}"
 	if ffmpeg -v error -stats -i "$f" -map 0 -c copy -tag:v hvc1 \
 		-movflags +faststart "$out"; then
-		echo "  готово"
+		echo "  done"
 	else
-		echo "  ОШИБКА" >&2
+		echo "  ERROR" >&2
 		rm -f "$out"
 	fi
 done

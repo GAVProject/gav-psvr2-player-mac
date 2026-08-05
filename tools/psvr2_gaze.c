@@ -1,16 +1,16 @@
 /*
- * psvr2_gaze — проверка айтрекинга PSVR2 через PC-адаптер.
+ * psvr2_gaze — check PSVR2 eye tracking via the PC adapter.
  *
- * Протокол из PSVR2Toolkit (BnuuySolutions, MIT):
+ * Protocol from PSVR2Toolkit (BnuuySolutions, MIT):
  * https://github.com/BnuuySolutions/PSVR2Toolkit
- *   - поток взгляда: интерфейс 5, bulk IN 0x85, пакеты hmd2_gaze_status_t
- *     (0x148 байт, сигнатура 'G','S')
- *   - включение: vendor control 0x09, report_id 0x0C (повторять при таймауте:
- *     поток глохнет после смены DP-сигнала и выхода из passthrough)
+ *   - gaze stream: interface 5, bulk IN 0x85, hmd2_gaze_status_t packets
+ *     (0x148 bytes, signature 'G','S')
+ *   - enable: vendor control 0x09, report_id 0x0C (resend on timeout:
+ *     the stream stalls after a DP signal change or leaving passthrough)
  *
- * Калибровка (gaze_calibration_blob.bin) в Toolkit закрыта; без неё
- * направление взгляда может быть неточным, но валидность/моргание/зрачок
- * должны читаться.
+ * The calibration (gaze_calibration_blob.bin) is closed in the Toolkit;
+ * without it the gaze direction may be inaccurate, but validity/blink/pupil
+ * should still be readable.
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -97,7 +97,7 @@ struct control_payload {
 static volatile sig_atomic_t stop = 0;
 static void on_sigint(int sig) { (void)sig; stop = 1; }
 
-/* Включение потока взгляда: SET-вариант ControlCommand из Toolkit */
+/* Enable the gaze stream: SET variant of ControlCommand from the Toolkit */
 static int gaze_enable(libusb_device_handle *dev)
 {
 	struct control_payload p;
@@ -114,24 +114,24 @@ static int gaze_enable(libusb_device_handle *dev)
 int main(void)
 {
 	signal(SIGINT, on_sigint);
-	printf("Размер gaze_status_t: 0x%zx (ожидается 0x148)\n", sizeof(gaze_status_t));
+	printf("gaze_status_t size: 0x%zx (expected 0x148)\n", sizeof(gaze_status_t));
 
 	libusb_context *ctx = NULL;
 	libusb_init(&ctx);
 	libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
 	if (dev == NULL) {
-		fprintf(stderr, "PSVR2 не найден\n");
+		fprintf(stderr, "PSVR2 not found\n");
 		return 1;
 	}
 	if (libusb_claim_interface(dev, GAZE_INTERFACE) != 0) {
-		fprintf(stderr, "интерфейс %d занят (закрой плеер)\n", GAZE_INTERFACE);
+		fprintf(stderr, "interface %d is busy (close the player)\n", GAZE_INTERFACE);
 		return 1;
 	}
 
 	int ret = gaze_enable(dev);
-	printf("Команда включения взгляда: %s\n",
-	       ret == 0 ? "отправлена" : libusb_error_name(ret));
-	printf("Читаю поток (Ctrl+C для выхода)...\n\n");
+	printf("Gaze enable command: %s\n",
+	       ret == 0 ? "sent" : libusb_error_name(ret));
+	printf("Reading the stream (Ctrl+C to exit)...\n\n");
 
 	static uint8_t buf[4096];
 	int packets = 0, gaze_packets = 0;
@@ -139,17 +139,17 @@ int main(void)
 		int transferred = 0;
 		ret = libusb_bulk_transfer(dev, GAZE_ENDPOINT, buf, sizeof(buf), &transferred, 500);
 		if (ret == LIBUSB_ERROR_TIMEOUT) {
-			gaze_enable(dev); /* поток глохнет — переспрашиваем */
+			gaze_enable(dev); /* the stream stalls — ask again */
 			continue;
 		}
 		if (ret != 0) {
-			fprintf(stderr, "чтение: %s\n", libusb_error_name(ret));
+			fprintf(stderr, "read: %s\n", libusb_error_name(ret));
 			break;
 		}
 		packets++;
 		if (transferred < (int)sizeof(gaze_status_t)) {
 			if (packets < 4) {
-				printf("пакет %d байт, первые: %02x %02x %02x %02x\n",
+				printf("packet %d bytes, first: %02x %02x %02x %02x\n",
 				       transferred, buf[0], buf[1], buf[2], buf[3]);
 			}
 			continue;
@@ -158,7 +158,7 @@ int main(void)
 		gaze_status_t *g = (gaze_status_t *)buf;
 		if (g->magic[0] != 'G' || g->magic[1] != 'S') {
 			if (packets < 4) {
-				printf("не GS-пакет: %c%c (%d байт)\n", g->magic[0], g->magic[1], transferred);
+				printf("not a GS packet: %c%c (%d bytes)\n", g->magic[0], g->magic[1], transferred);
 			}
 			continue;
 		}
@@ -168,14 +168,14 @@ int main(void)
 		}
 		const wearable_eye_t *l = &g->wearable.left;
 		const wearable_eye_t *r = &g->wearable.right;
-		printf("кадр %u: взгляд L(%.3f, %.3f, %.3f)%s R(%.3f, %.3f, %.3f)%s\n",
+		printf("frame %u: gaze L(%.3f, %.3f, %.3f)%s R(%.3f, %.3f, %.3f)%s\n",
 		       g->wearable.frame_counter,
 		       l->gaze_dir_norm.x, l->gaze_dir_norm.y, l->gaze_dir_norm.z,
-		       l->is_gaze_dir_valid ? "" : " (невалид)",
+		       l->is_gaze_dir_valid ? "" : " (invalid)",
 		       r->gaze_dir_norm.x, r->gaze_dir_norm.y, r->gaze_dir_norm.z,
-		       r->is_gaze_dir_valid ? "" : " (невалид)");
-		printf("          зрачок L %.2f мм R %.2f мм · моргание L %d R %d · "
-		       "общий (%.3f, %.3f, %.3f) · сведение %.0f мм\n",
+		       r->is_gaze_dir_valid ? "" : " (invalid)");
+		printf("          pupil L %.2f mm R %.2f mm · blink L %d R %d · "
+		       "combined (%.3f, %.3f, %.3f) · convergence %.0f mm\n",
 		       l->pupil_dia_mm, r->pupil_dia_mm, l->blink, r->blink,
 		       g->foveated.gaze_dir_combined_norm.x,
 		       g->foveated.gaze_dir_combined_norm.y,
@@ -183,11 +183,11 @@ int main(void)
 		       g->foveated.convergence_distance_mm);
 	}
 
-	printf("\nИтого: %d пакетов, из них GS-структур: %d\n", packets, gaze_packets);
+	printf("\nTotal: %d packets, of which GS structures: %d\n", packets, gaze_packets);
 	if (gaze_packets > 0) {
-		printf("=== АЙТРЕКИНГ РАБОТАЕТ ===\n");
+		printf("=== EYE TRACKING WORKS ===\n");
 	} else {
-		printf("=== Взгляд не пошёл: поток молчит или отдаёт другой формат ===\n");
+		printf("=== Gaze did not start: the stream is silent or uses another format ===\n");
 	}
 
 	libusb_release_interface(dev, GAZE_INTERFACE);

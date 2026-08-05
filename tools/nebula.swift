@@ -1,8 +1,8 @@
-// Генератор equirect-панорамы «космос под OLED»: фон — чистый 0,0,0,
-// вдоль наклонённого большого круга — контрастная цветная туманность
-// (fbm-шум с доменным искажением), плюс отдельные облака-«блобы» и звёзды.
-// Шум сэмплируется по 3D-направлению — панорама без швов и полюсных артефактов.
-// Использование: swift -O nebula.swift <ширина> <out.jpg> [вариант]
+// Generator of an equirect "space made for OLED" panorama: pure 0,0,0
+// background, with a contrasting colored nebula along a tilted great circle
+// (fbm noise with domain warping), plus separate cloud "blobs" and stars.
+// Noise is sampled by 3D direction — seamless panorama, no pole artifacts.
+// Usage: swift -O nebula.swift <width> <out.jpg> [variant]
 import CoreGraphics
 import CoreImage
 import Foundation
@@ -11,11 +11,11 @@ import simd
 let W = CommandLine.arguments.count > 1 ? Int(CommandLine.arguments[1])! : 8192
 let H = W / 2
 let outPath = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : "nebula.jpg"
-// Номер варианта: сдвигает домен шума — та же стилистика, другой рисунок
+// Variant number: shifts the noise domain — same style, different pattern
 let variant = CommandLine.arguments.count > 3 ? Float(CommandLine.arguments[3])! : 0
 let seedOff = SIMD3<Float>(variant * 37.31, variant * 61.77, variant * 23.19)
 
-// MARK: - Шум
+// MARK: - Noise
 
 @inline(__always) func hash3(_ x: Int32, _ y: Int32, _ z: Int32) -> Float {
     var h = UInt32(bitPattern: x) &* 374761393
@@ -56,11 +56,11 @@ let seedOff = SIMD3<Float>(variant * 37.31, variant * 61.77, variant * 23.19)
     return v // ~0..1
 }
 
-// MARK: - Сцена
+// MARK: - Scene
 
 let bandNormal = simd_normalize(SIMD3<Float>(0.42, 0.88, 0.22))
-// Отдельные облака: направление, радиус, палитра (0 — сине-бирюзовая,
-// 1 — пурпурно-розовая, 2 — тёпло-оранжевая)
+// Separate clouds: direction, radius, palette (0 — blue-teal,
+// 1 — purple-pink, 2 — warm orange)
 let blobs: [(dir: SIMD3<Float>, r: Float, pal: Int)] = [
     (simd_normalize(SIMD3<Float>(0.8, 0.15, -0.55)), 0.48, 1),
     (simd_normalize(SIMD3<Float>(-0.75, -0.3, 0.58)), 0.42, 2),
@@ -71,7 +71,7 @@ let blobs: [(dir: SIMD3<Float>, r: Float, pal: Int)] = [
     a + (b - a) * t
 }
 
-// Палитры: тёмная основа -> яркий край -> «ядро»
+// Palettes: dark base -> bright edge -> "core"
 let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
     (SIMD3(0.02, 0.06, 0.22), SIMD3(0.05, 0.65, 0.85), SIMD3(0.75, 0.95, 1.0)),
     (SIMD3(0.10, 0.02, 0.20), SIMD3(0.65, 0.12, 0.75), SIMD3(1.0, 0.65, 0.9)),
@@ -79,7 +79,7 @@ let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
 ]
 
 @inline(__always) func nebulaColor(_ dir: SIMD3<Float>) -> SIMD3<Float> {
-    // Маски областей: полоса + блобы; вне их — сразу чёрный (дёшево)
+    // Region masks: band + blobs; outside them — immediately black (cheap)
     let bandD = abs(simd_dot(dir, bandNormal))
     var mask = max(0, 1 - bandD / 0.30)
     var pal = 0
@@ -97,7 +97,7 @@ let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
         return .zero
     }
 
-    // Доменное искажение: клочковатые волокна
+    // Domain warping: wispy filaments
     let s = dir * 3.1 + seedOff
     let warp = SIMD3<Float>(
         fbm(s + SIMD3(11.7, 3.1, 7.9), 5),
@@ -106,8 +106,8 @@ let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
     let n = fbm(dir * 5.6 + warp + seedOff, 6)
     let detail = fbm(dir * 14.0 + warp * 1.4 + seedOff, 5)
 
-    // Мягкое свечение-подложка + яркие волокна поверх; порог держит
-    // большую часть поля в нуле — фон чисто чёрный
+    // Soft glow underlay + bright filaments on top; the threshold keeps
+    // most of the field at zero — the background stays pure black
     let haze = max(0, fbm(dir * 2.4 + warp * 0.7 + seedOff, 4) - 0.40) * 1.8
     let fil = max(0, n * (0.55 + 0.45 * detail) - 0.24) * 3.4
     let density = min(1, haze * 0.40 + fil * fil) * smooth(min(1, mask * 1.8))
@@ -115,7 +115,7 @@ let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
         return .zero
     }
 
-    // Вдоль полосы оттенок плавно гуляет между сине-бирюзовым и пурпурным
+    // Along the band the hue drifts smoothly between blue-teal and purple
     var (base, edge, core) = palettes[pal]
     if pal == 0 {
         let hueT = smooth(min(1, max(0, fbm(dir * 1.7 + SIMD3(3.3, 8.8, 1.2) + seedOff, 3) * 2.2 - 0.55)))
@@ -130,13 +130,13 @@ let palettes: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = [
     return c * density
 }
 
-// MARK: - Рендер туманности
+// MARK: - Nebula render
 
 var buf = [Float](repeating: 0, count: W * H * 3)
 buf.withUnsafeMutableBufferPointer { bp in
     let px = bp.baseAddress!
     DispatchQueue.concurrentPerform(iterations: H) { y in
-        let theta = (Float(y) + 0.5) / Float(H) * Float.pi // 0 — верх
+        let theta = (Float(y) + 0.5) / Float(H) * Float.pi // 0 — top
         let sy = sin(theta), cy = cos(theta)
         for x in 0..<W {
             let phi = (Float(x) + 0.5) / Float(W) * 2 * Float.pi - Float.pi
@@ -151,7 +151,7 @@ buf.withUnsafeMutableBufferPointer { bp in
     }
 }
 
-// MARK: - Звёзды (аддитивно поверх)
+// MARK: - Stars (additive on top)
 
 var seed: UInt64 = 20260805 &+ UInt64(variant) &* 7919
 @inline(__always) func rnd() -> Float {
@@ -172,7 +172,7 @@ buf.withUnsafeMutableBufferPointer { bp in
             for dx in -r...r {
                 var xx = ix + dx
                 if xx < 0 { xx += W }
-                if xx >= W { xx -= W } // горизонтальный шов замкнут
+                if xx >= W { xx -= W } // horizontal seam wraps around
                 let fx = Float(dx) - (cx - Float(ix))
                 let fy = Float(dy) - (cy - Float(iy))
                 let q = (fx * fx + fy * fy) / (radius * radius)
@@ -192,7 +192,7 @@ buf.withUnsafeMutableBufferPointer { bp in
         let phi = rnd() * 2 * Float.pi
         let rr = (1 - z * z).squareRoot()
         let dir = SIMD3<Float>(rr * cos(phi), z, rr * sin(phi))
-        // В полосе туманности звёзд больше
+        // More stars within the nebula band
         let nearBand = abs(simd_dot(dir, bandNormal)) < 0.3
         if !nearBand && rnd() < 0.45 { continue }
         placed += 1
@@ -208,14 +208,14 @@ buf.withUnsafeMutableBufferPointer { bp in
             : (t > 0.82 ? SIMD3(1.0, 0.85, 0.66) : SIMD3(1, 1, 1))
         let radius = (1.3 + 5.0 * m) * Float(W) / 8192
         splat(cx, cy, radius, col * bright)
-        // Лёгкие «лучи» у самых ярких
+        // Faint "rays" around the brightest ones
         if m > 0.85 {
             splat(cx, cy, radius * 2.6, col * bright * 0.10)
         }
     }
 }
 
-// MARK: - Сохранение
+// MARK: - Saving
 
 let ctx = CGContext(
     data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W * 4,

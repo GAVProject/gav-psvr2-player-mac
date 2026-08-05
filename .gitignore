@@ -1,6 +1,7 @@
 # Сборка
 *.o
 player/psvr2player
+player/PSVR2Player.app
 tools/psvr2_probe
 
 # Артефакты запуска

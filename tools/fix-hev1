@@ -1,0 +1,86 @@
+#!/bin/zsh
+# Перепаковка HEVC-видео из тега hev1 в hvc1.
+#
+# AVFoundation (а значит и наш плеер, и QuickTime) не декодирует HEVC с тегом
+# hev1 — параметры кодека лежат внутри потока, а Apple ждёт их в заголовке
+# дорожки. Признак в логе плеера: «hev1 … декодируется: НЕТ».
+#
+# Перекодирования НЕ происходит: потоки копируются как есть, меняется только
+# тег. Качество не теряется, скорость — как копирование файла.
+#
+# Использование:
+#   ./fix-hev1 файл.mp4 [ещё файлы...]
+#   ./fix-hev1 /путь/к/папке        — рекурсивно все mp4/mov/m4v в папке
+#   ./fix-hev1 -n /путь/к/папке     — только показать, что требует перепаковки
+#
+# Рядом с исходником появится файл с суффиксом _hvc1.
+
+set -u
+
+if ! command -v ffmpeg >/dev/null; then
+	echo "Нужен ffmpeg: brew install ffmpeg" >&2
+	exit 1
+fi
+
+dry_run=0
+if [[ "${1:-}" == "-n" ]]; then
+	dry_run=1
+	shift
+fi
+
+if [[ $# -eq 0 ]]; then
+	echo "Использование: $0 [-n] <файл.mp4 | папка> [...]" >&2
+	exit 1
+fi
+
+typeset -a files
+for arg in "$@"; do
+	if [[ -d "$arg" ]]; then
+		files+=("$arg"/**/*.(mp4|mov|m4v)(N))
+	else
+		files+=("$arg")
+	fi
+done
+
+echo "Файлов для проверки: ${#files[@]}"
+if (( dry_run )); then
+	total=0
+	for f in "${files[@]}"; do
+		[[ -f "$f" ]] || continue
+		tag=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_tag_string \
+			-of default=nw=1:nk=1 "$f" 2>/dev/null)
+		if [[ "$tag" == "hev1" ]]; then
+			size=$(du -h "$f" | cut -f1)
+			echo "  требует перепаковки ($size): $f"
+			(( total++ ))
+		fi
+	done
+	echo "Итого hev1: $total"
+	exit 0
+fi
+
+for f in "${files[@]}"; do
+	[[ -f "$f" ]] || continue
+
+	tag=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_tag_string \
+		-of default=nw=1:nk=1 "$f" 2>/dev/null)
+	if [[ "$tag" != "hev1" ]]; then
+		echo "· ${f:t} — тег $tag, перепаковка не нужна"
+		continue
+	fi
+
+	out="${f:r}_hvc1.${f:e}"
+	if [[ -e "$out" ]]; then
+		echo "· ${f:t} — уже есть ${out:t}, пропускаю"
+		continue
+	fi
+
+	echo "→ ${f:t} → ${out:t}"
+	if ffmpeg -v error -stats -i "$f" -map 0 -c copy -tag:v hvc1 \
+		-movflags +faststart "$out"; then
+		echo "  готово"
+	else
+		echo "  ОШИБКА" >&2
+		rm -f "$out"
+	fi
+done

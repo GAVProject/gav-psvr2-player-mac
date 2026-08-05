@@ -26,7 +26,7 @@ final class UIOverlay {
     private enum ButtonAction {
         case ui(UIAction)
         case pickerEntry(Int)
-        case pickerUp, pickerDown, pickerCancel
+        case pickerUp, pickerDown, pickerCancel, pickerDrives, pickerAccess
         case showPicker
     }
 
@@ -34,6 +34,7 @@ final class UIOverlay {
         let rect: CGRect // CG-координаты текстуры (origin слева внизу)
         let label: () -> String
         let action: ButtonAction
+        var highlighted = false // текущий открытый файл
     }
 
     private struct PickerEntry {
@@ -55,6 +56,9 @@ final class UIOverlay {
 
     weak var renderer: Renderer?
     var onOpenFile: ((URL) -> Void)?
+    // true — окно поверх всего (обычный режим), false — опустить,
+    // чтобы системный диалог доступа не оказался под нашим окном
+    var onWindowLevelRequest: ((Bool) -> Void)?
 
     private var mode = PanelMode.controls
     private var buttons: [Button] = []
@@ -63,6 +67,19 @@ final class UIOverlay {
     private var pickerScroll = 0
     private let pickerRows = 6
     private let videoExtensions: Set<String> = ["mp4", "m4v", "mov"]
+
+    // Последний открытый файл — подсвечиваем в списке
+    private var currentFile: URL?
+    // Позиция прокрутки на папку, чтобы вернуться в то же место
+    private var scrollMemory: [String: Int] = [:]
+
+    // Чтение каталога идёт в фоне: на внешних/сетевых томах оно может
+    // блокироваться (раскрутка диска, запрос доступа macOS)
+    private var loading = false
+    private var loadStarted = 0.0
+    private var loadToken = 0
+    private var mouseCaptured = false
+    private var releasedForDialog = false
 
     private var lastActivity = CACurrentMediaTime()
     private var lastRedraw = 0.0
@@ -79,9 +96,9 @@ final class UIOverlay {
     // Что показывать в шейдере: панель и/или плашку OSD
     var displayVisible: Bool { active || osdActive }
 
-    func showOSD(_ text: String) {
+    func showOSD(_ text: String, duration: Double = 1.5) {
         osdText = text
-        osdUntil = CACurrentMediaTime() + 1.5
+        osdUntil = CACurrentMediaTime() + duration
         osdDirty = true
         redrawSoon()
     }
@@ -130,9 +147,20 @@ final class UIOverlay {
 
     // MARK: - Кнопки: режим выбора файла
 
+    // Файл, открытый из аргумента командной строки
+    func setCurrentFile(_ url: URL) {
+        currentFile = url
+    }
+
     func openPicker(startDir: URL? = nil) {
         mode = .picker
         var dir = startDir
+        if dir == nil, let current = currentFile {
+            dir = current.deletingLastPathComponent()
+        }
+        if dir == nil, let saved = UserDefaults.standard.string(forKey: "lastFile") {
+            currentFile = URL(fileURLWithPath: saved)
+        }
         if dir == nil, let saved = UserDefaults.standard.string(forKey: "lastDir") {
             let url = URL(fileURLWithPath: saved)
             var isDir: ObjCBool = false
@@ -153,34 +181,71 @@ final class UIOverlay {
     }
 
     private func loadDir(_ dir: URL) {
+        // Запоминаем, где остановились в покидаемой папке
+        if !pickerEntries.isEmpty {
+            scrollMemory[pickerDir.path] = pickerScroll
+        }
         pickerDir = dir
         pickerScroll = 0
         pickerEntries = []
+        loading = true
+        loadStarted = CACurrentMediaTime()
+        loadToken += 1
+        let token = loadToken
+        buildPickerButtons()
+        redrawSoon()
 
-        if dir.path != "/" {
-            pickerEntries.append(PickerEntry(url: dir.deletingLastPathComponent(), isDir: true, name: ".."))
-        }
+        let exts = videoExtensions
+        DispatchQueue.global(qos: .userInitiated).async {
+            var entries: [PickerEntry] = []
+            if dir.path == "/" {
+                // Выше корня — список смонтированных дисков
+                entries.append(PickerEntry(
+                    url: URL(fileURLWithPath: "/Volumes"), isDir: true, name: ".."))
+            } else if dir.path != "/Volumes" {
+                entries.append(PickerEntry(
+                    url: dir.deletingLastPathComponent(), isDir: true, name: ".."))
+            }
 
-        let contents = (try? FileManager.default.contentsOfDirectory(
-            at: dir, includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles])) ?? []
+            // Симлинки разворачиваем: /Volumes/Macintosh HD ведёт на /
+            let target = dir.resolvingSymlinksInPath()
+            let contents = (try? FileManager.default.contentsOfDirectory(
+                at: target, includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles])) ?? []
 
-        var dirs: [PickerEntry] = []
-        var files: [PickerEntry] = []
-        for url in contents {
-            let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-            if isDir {
-                dirs.append(PickerEntry(url: url, isDir: true, name: url.lastPathComponent))
-            } else if videoExtensions.contains(url.pathExtension.lowercased()) {
-                files.append(PickerEntry(url: url, isDir: false, name: url.lastPathComponent))
+            var dirs: [PickerEntry] = []
+            var files: [PickerEntry] = []
+            for url in contents {
+                // fileExists следует симлинкам — важно для /Volumes/Macintosh HD
+                var isDirObjC: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirObjC) else {
+                    continue
+                }
+                if isDirObjC.boolValue {
+                    dirs.append(PickerEntry(url: url, isDir: true, name: url.lastPathComponent))
+                } else if exts.contains(url.pathExtension.lowercased()) {
+                    files.append(PickerEntry(url: url, isDir: false, name: url.lastPathComponent))
+                }
+            }
+            let byName: (PickerEntry, PickerEntry) -> Bool = {
+                $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+            entries += dirs.sorted(by: byName) + files.sorted(by: byName)
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.loadToken == token else { return }
+                self.pickerEntries = entries
+                self.loading = false
+                self.restoreScroll()
+                if self.releasedForDialog {
+                    self.releasedForDialog = false
+                    self.onWindowLevelRequest?(true)
+                    self.captureMouse()
+                }
+                self.buildPickerButtons()
+                self.redrawSoon()
             }
         }
-        let byName: (PickerEntry, PickerEntry) -> Bool = {
-            $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
-        }
-        pickerEntries += dirs.sorted(by: byName) + files.sorted(by: byName)
-
-        buildPickerButtons()
     }
 
     private func buildPickerButtons() {
@@ -194,29 +259,56 @@ final class UIOverlay {
             guard idx < pickerEntries.count else { break }
             let yTop = 76.0 + Double(i) * (rowH + gap)
             let entry = pickerEntries[idx]
+            let inVolumes = pickerDir.path == "/Volumes"
+            let isCurrent = !entry.isDir && entry.url.path == currentFile?.path
             buttons.append(Button(
                 rect: CGRect(x: x0, y: Double(Self.texH) - yTop - rowH, width: w, height: rowH),
-                label: { (entry.isDir ? "📁 " : "🎬 ") + String(entry.name.prefix(48)) },
-                action: .pickerEntry(idx)))
+                label: {
+                    let icon = entry.isDir
+                        ? (inVolumes && entry.name != ".." ? "💾 " : "📁 ")
+                        : (isCurrent ? "▶ " : "🎬 ")
+                    return icon + String(entry.name.prefix(48))
+                },
+                action: .pickerEntry(idx),
+                highlighted: isCurrent))
         }
 
-        let bw = (w - 2 * gap) / 3
+        let bw = (w - 4 * gap) / 5
         let by = 10.0, bh = 56.0
-        buttons.append(Button(
-            rect: CGRect(x: x0, y: by, width: bw, height: bh),
-            label: { "▲" }, action: .pickerUp))
-        buttons.append(Button(
-            rect: CGRect(x: x0 + bw + gap, y: by, width: bw, height: bh),
-            label: { "▼" }, action: .pickerDown))
-        buttons.append(Button(
-            rect: CGRect(x: x0 + 2 * (bw + gap), y: by, width: bw, height: bh),
-            label: { "Отмена" }, action: .pickerCancel))
+        let bottom: [(String, ButtonAction)] = [
+            ("▲", .pickerUp),
+            ("▼", .pickerDown),
+            ("💾 Диски", .pickerDrives),
+            ("🔓 Доступ", .pickerAccess),
+            ("Отмена", .pickerCancel),
+        ]
+        for (i, item) in bottom.enumerated() {
+            buttons.append(Button(
+                rect: CGRect(x: x0 + Double(i) * (bw + gap), y: by, width: bw, height: bh),
+                label: { item.0 }, action: item.1))
+        }
+    }
+
+    // Возврат к прошлой позиции; если в папке лежит открытый файл — к нему
+    private func restoreScroll() {
+        let maxScroll = max(0, pickerEntries.count - pickerRows)
+
+        if let current = currentFile,
+           current.deletingLastPathComponent().path == pickerDir.path,
+           let idx = pickerEntries.firstIndex(where: { $0.url.path == current.path }) {
+            // Ставим файл в середину видимой области
+            pickerScroll = min(maxScroll, max(0, idx - pickerRows / 2))
+            return
+        }
+
+        pickerScroll = min(maxScroll, scrollMemory[pickerDir.path] ?? 0)
     }
 
     func scrollPicker(rows: Int) {
         guard mode == .picker else { return }
         markActivity()
         pickerScroll = max(0, min(max(0, pickerEntries.count - pickerRows), pickerScroll + rows))
+        scrollMemory[pickerDir.path] = pickerScroll
         buildPickerButtons()
         redrawSoon()
     }
@@ -264,6 +356,19 @@ final class UIOverlay {
             }
         }
 
+        // Долгое чтение тома: macOS могла показать запрос доступа на мониторе —
+        // отпускаем мышь, чтобы на него можно было ответить
+        if loading && !releasedForDialog && CACurrentMediaTime() - loadStarted > 1.5 {
+            releasedForDialog = true
+            releaseMouse(restorePosition: false)
+            // Опускаем окно: диалог доступа мог оказаться под ним
+            onWindowLevelRequest?(false)
+            showOSD("Снимите шлем: нужен ответ на запрос доступа")
+            print("[player] Чтение тома затянулось — вероятно, macOS ждёт разрешения доступа.")
+            print("[player] Снимите шлем и посмотрите на мониторы; если диалога нет —")
+            print("[player] нажмите в панели кнопку «🔓 Доступ» и добавьте PSVR2 Player вручную.")
+        }
+
         if CACurrentMediaTime() - lastActivity > 3.0 {
             hide()
             return
@@ -276,31 +381,40 @@ final class UIOverlay {
         }
     }
 
+    private func captureMouse() {
+        guard captureEnabled, !mouseCaptured else { return }
+        mouseCaptured = true
+        savedMousePos = CGEvent(source: nil)?.location
+        if let warp = warpPoint {
+            CGWarpMouseCursorPosition(warp)
+        }
+        CGAssociateMouseAndMouseCursorPosition(0)
+        NSCursor.hide()
+    }
+
+    private func releaseMouse(restorePosition: Bool = true) {
+        guard mouseCaptured else { return }
+        mouseCaptured = false
+        CGAssociateMouseAndMouseCursorPosition(1)
+        NSCursor.unhide()
+        if restorePosition, let pos = savedMousePos {
+            CGWarpMouseCursorPosition(pos)
+        }
+    }
+
     private func show() {
         active = true
         cursorU = 0.5
         cursorV = 0.5
-        if captureEnabled {
-            savedMousePos = CGEvent(source: nil)?.location
-            if let warp = warpPoint {
-                CGWarpMouseCursorPosition(warp)
-            }
-            CGAssociateMouseAndMouseCursorPosition(0)
-            NSCursor.hide()
-        }
+        captureMouse()
         redraw()
     }
 
     func hide() {
         guard active else { return }
         active = false
-        if captureEnabled {
-            CGAssociateMouseAndMouseCursorPosition(1)
-            NSCursor.unhide()
-            if let pos = savedMousePos {
-                CGWarpMouseCursorPosition(pos)
-            }
-        }
+        releasedForDialog = false
+        releaseMouse()
     }
 
     private func cursorCGPoint() -> CGPoint {
@@ -335,6 +449,9 @@ final class UIOverlay {
             } else {
                 UserDefaults.standard.set(
                     entry.url.deletingLastPathComponent().path, forKey: "lastDir")
+                UserDefaults.standard.set(entry.url.path, forKey: "lastFile")
+                currentFile = entry.url
+                scrollMemory[pickerDir.path] = pickerScroll
                 mode = .controls
                 buildControlButtons()
                 onOpenFile?(entry.url)
@@ -344,6 +461,23 @@ final class UIOverlay {
             scrollPicker(rows: -pickerRows)
         case .pickerDown:
             scrollPicker(rows: pickerRows)
+        case .pickerDrives:
+            loadDir(URL(fileURLWithPath: "/Volumes"))
+            redrawSoon()
+        case .pickerAccess:
+            // «Полный доступ к диску» — единственный раздел, куда приложение
+            // можно добавить вручную кнопкой «+»
+            releaseMouse(restorePosition: false)
+            onWindowLevelRequest?(false)
+            releasedForDialog = true
+            if let url = URL(string:
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                NSWorkspace.shared.open(url)
+            }
+            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+            showOSD("Снимите шлем: добавьте приложение в настройках")
+            print("[player] Полный доступ к диску → «+» → перетащите PSVR2Player.app")
+            print("[player] Путь: \(Bundle.main.bundleURL.path)")
         case .pickerCancel:
             if renderer?.video != nil {
                 mode = .controls
@@ -406,9 +540,13 @@ final class UIOverlay {
         for (i, b) in buttons.enumerated() {
             let hovered = i == lastHovered
             ctx.addPath(CGPath(roundedRect: b.rect, cornerWidth: 14, cornerHeight: 14, transform: nil))
-            ctx.setFillColor(hovered
-                ? CGColor(red: 0.36, green: 0.42, blue: 0.95, alpha: 0.95)
-                : CGColor(red: 0.20, green: 0.22, blue: 0.27, alpha: 0.95))
+            if hovered {
+                ctx.setFillColor(CGColor(red: 0.36, green: 0.42, blue: 0.95, alpha: 0.95))
+            } else if b.highlighted {
+                ctx.setFillColor(CGColor(red: 0.24, green: 0.33, blue: 0.52, alpha: 0.95))
+            } else {
+                ctx.setFillColor(CGColor(red: 0.20, green: 0.22, blue: 0.27, alpha: 0.95))
+            }
             ctx.fillPath()
             let fontSize: CGFloat = mode == .picker ? 26 : 34
             drawText(b.label(), in: b.rect, size: fontSize, color: .white,
@@ -428,7 +566,8 @@ final class UIOverlay {
         case .picker:
             let path = pickerDir.path
             let shown = path.count > 52 ? "…" + path.suffix(51) : path
-            drawText(shown, in: topRect, size: 26, color: NSColor(white: 0.75, alpha: 1))
+            drawText(loading ? "Чтение… " + shown : shown,
+                     in: topRect, size: 26, color: NSColor(white: 0.75, alpha: 1))
         }
 
         drawOSDIfNeeded(ctx)

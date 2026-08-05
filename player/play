@@ -1,0 +1,28 @@
+#!/bin/zsh
+# Запуск плеера как самостоятельного приложения (через open), а не дочерним
+# процессом терминала. Это важно для доступа к внешним дискам: иначе macOS
+# считает «ответственным» терминал и запрашивает права от его имени.
+# Лог приложения выводится сюда же.
+cd "$(dirname "$0")"
+
+APP="$PWD/PSVR2Player.app"
+BIN="$APP/Contents/MacOS/psvr2player"
+LOG="${TMPDIR:-/tmp}/psvr2player.log"
+
+if [[ ! -x "$BIN" ]]; then
+	echo "Нет собранного приложения. Выполните: make" >&2
+	exit 1
+fi
+
+: > "$LOG"
+open -a "$APP" --stdout "$LOG" --stderr "$LOG" --args "$@" || exit 1
+
+# Показываем лог, пока приложение работает
+tail -f "$LOG" &
+TAIL_PID=$!
+trap 'kill $TAIL_PID 2>/dev/null' EXIT INT TERM
+
+sleep 1
+while pgrep -qf "PSVR2Player.app/Contents/MacOS/psvr2player"; do
+	sleep 1
+done

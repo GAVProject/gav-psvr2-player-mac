@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""Мгновенная правка тега hev1 → hvc1 прямо в файле (4 байта).
+
+Зачем: macOS/AVFoundation не декодирует HEVC с тегом hev1, хотя во многих
+таких файлах параметры кодека (VPS/SPS/PPS) уже лежат в заголовке дорожки
+(бокс hvcC) — то есть содержимое полностью соответствует hvc1, неверен только
+тег. В этом случае перепаковка не нужна: правим 4 байта и файл открывается.
+
+Данные видео не трогаются: меняется единственное поле в заголовке, поэтому
+операция занимает миллисекунды даже для файла на 50 ГБ, лежащего на HDD.
+
+Если параметров в заголовке нет (редкий случай), файл пропускается — для него
+нужна полная перепаковка утилитой fix-hev1.
+
+Использование:
+    tag-hvc1 -n <файл|папка> ...   показать, что можно исправить (ничего не меняя)
+    tag-hvc1 <файл|папка> ...      исправить
+    tag-hvc1 -r <файл|папка> ...   вернуть обратно hvc1 → hev1
+"""
+
+import os
+import struct
+import sys
+
+VIDEO_EXT = {".mp4", ".mov", ".m4v"}
+CONTAINERS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}
+
+
+def find_sample_entries(fh, start, end):
+    """Смещения записей stsd: [(смещение тега, тег, смещение записи, размер)]."""
+    entries = []
+    fh.seek(start)
+    while fh.tell() < end - 8:
+        pos = fh.tell()
+        header = fh.read(8)
+        if len(header) < 8:
+            break
+        size, typ = struct.unpack(">I4s", header)
+        if size == 1:
+            size = struct.unpack(">Q", fh.read(8))[0]
+            body = pos + 16
+        elif size == 0:
+            size = end - pos
+            body = pos + 8
+        else:
+            body = pos + 8
+        if size < 8 or pos + size > end:
+            break
+
+        if typ in CONTAINERS:
+            entries += find_sample_entries(fh, body, pos + size)
+        elif typ == b"stsd":
+            fh.seek(body + 4)  # version + flags
+            count = struct.unpack(">I", fh.read(4))[0]
+            for _ in range(count):
+                epos = fh.tell()
+                if epos + 8 > end:
+                    break
+                esize, etype = struct.unpack(">I4s", fh.read(8))
+                if esize < 8:
+                    break
+                entries.append((epos + 4, etype, epos, esize))
+                fh.seek(epos + esize)
+        fh.seek(pos + size)
+    return entries
+
+
+def hvcc_has_parameter_sets(fh, entry_pos, entry_size):
+    """Есть ли в hvcC наборы параметров SPS и PPS."""
+    fh.seek(entry_pos)
+    data = fh.read(entry_size)
+    idx = data.find(b"hvcC")
+    if idx < 0:
+        return False, "нет бокса hvcC"
+
+    box = data[idx + 4:]
+    if len(box) < 23:
+        return False, "hvcC обрезан"
+
+    num_arrays = box[22]
+    p = 23
+    kinds = set()
+    for _ in range(num_arrays):
+        if p + 3 > len(box):
+            return False, "hvcC повреждён"
+        nal_type = box[p] & 0x3F
+        count = struct.unpack(">H", box[p + 1:p + 3])[0]
+        p += 3
+        for _ in range(count):
+            if p + 2 > len(box):
+                return False, "hvcC повреждён"
+            length = struct.unpack(">H", box[p:p + 2])[0]
+            p += 2 + length
+        if count:
+            kinds.add(nal_type)
+
+    if 33 in kinds and 34 in kinds:
+        names = {32: "VPS", 33: "SPS", 34: "PPS"}
+        return True, ", ".join(names.get(k, str(k)) for k in sorted(kinds))
+    return False, "в hvcC нет SPS/PPS"
+
+
+def process(path, dry_run, revert):
+    src, dst = (b"hvc1", b"hev1") if revert else (b"hev1", b"hvc1")
+
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        try:
+            entries = find_sample_entries(fh, 0, size)
+        except (struct.error, OSError) as exc:
+            print(f"  ! {os.path.basename(path)}: не разобрать ({exc})")
+            return 0
+
+        targets = []
+        for tag_off, tag, epos, esize in entries:
+            if tag != src:
+                continue
+            ok, detail = hvcc_has_parameter_sets(fh, epos, esize)
+            if not ok and not revert:
+                print(f"  · {os.path.basename(path)}: {detail} — нужна перепаковка "
+                      f"(tools/fix-hev1)")
+                continue
+            targets.append((tag_off, detail))
+
+    if not targets:
+        return 0
+
+    detail = targets[0][1]
+    if dry_run:
+        print(f"  → {os.path.basename(path)}: можно исправить ({detail})")
+        return len(targets)
+
+    with open(path, "r+b") as fh:
+        for tag_off, _ in targets:
+            fh.seek(tag_off)
+            fh.write(dst)
+    print(f"  ✓ {os.path.basename(path)}: {src.decode()} → {dst.decode()} ({detail})")
+    return len(targets)
+
+
+def collect(paths):
+    files = []
+    for p in paths:
+        if os.path.isdir(p):
+            for root, _, names in os.walk(p):
+                for n in sorted(names):
+                    if os.path.splitext(n)[1].lower() in VIDEO_EXT:
+                        files.append(os.path.join(root, n))
+        elif os.path.isfile(p):
+            files.append(p)
+    return files
+
+
+def main():
+    args = sys.argv[1:]
+    dry_run = "-n" in args
+    revert = "-r" in args
+    paths = [a for a in args if not a.startswith("-")]
+
+    if not paths:
+        print(__doc__)
+        return 1
+
+    files = collect(paths)
+    print(f"Проверяю файлов: {len(files)}")
+
+    fixed = 0
+    for path in files:
+        try:
+            fixed += process(path, dry_run, revert)
+        except OSError as exc:
+            print(f"  ! {os.path.basename(path)}: {exc}")
+
+    if dry_run:
+        print(f"Можно исправить дорожек: {fixed}")
+    else:
+        print(f"Исправлено дорожек: {fixed}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

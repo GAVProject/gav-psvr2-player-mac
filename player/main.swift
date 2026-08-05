@@ -12,6 +12,7 @@ import AVFoundation
 import CoreAudio
 import Metal
 import MetalKit
+import VideoToolbox
 import simd
 
 // MARK: - Метал-шейдер
@@ -42,6 +43,7 @@ struct Uniforms {
     float4 p1;       // гироскоп в мировых осях (xyz) + длительность развёртки (w), с
     float4 p2;       // x: хроматика, y: панель UI видима, zw: курсор (uv текстуры панели)
     float4 p3;       // панель в tan-пространстве: центр (xy), полуразмеры (zw)
+    float4 p4;       // x: есть видео, y: полный диапазон YUV, z: BT.2020, w: кадр BGRA
 };
 
 constant float FX = 0.3585564;
@@ -82,12 +84,39 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
     return float2(u, v);
 }
 
+// Кадры берём в родном YUV 4:2:0 (втрое меньше памяти, чем BGRA: для 8K
+// это критично) и переводим в RGB здесь
+static float3 yuv_to_rgb(float y, float2 cbcr, bool fullRange, bool bt2020) {
+    if (!fullRange) {
+        y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+        cbcr = (cbcr - 128.0 / 255.0) * (255.0 / 224.0);
+    } else {
+        cbcr -= 0.5;
+    }
+    float3 rgb;
+    if (bt2020) {
+        rgb = float3(y + 1.4746 * cbcr.y,
+                     y - 0.16455 * cbcr.x - 0.57135 * cbcr.y,
+                     y + 1.8814 * cbcr.x);
+    } else { // BT.709
+        rgb = float3(y + 1.5748 * cbcr.y,
+                     y - 0.1873 * cbcr.x - 0.4681 * cbcr.y,
+                     y + 1.8556 * cbcr.x);
+    }
+    return saturate(rgb);
+}
+
 fragment float4 fs_main(VSOut in [[stage_in]],
                         constant Uniforms &uni [[buffer(0)]],
                         device const packed_float3 *lut [[buffer(1)]],
-                        texture2d<float> video [[texture(0)]],
-                        texture2d<float> ui [[texture(1)]]) {
+                        texture2d<float> videoY [[texture(0)]],
+                        texture2d<float> ui [[texture(1)]],
+                        texture2d<float> videoCbCr [[texture(2)]]) {
     constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
+
+    bool hasVideo = uni.p4.x > 0.5;
+    bool fullRange = uni.p4.y > 0.5;
+    bool bt2020 = uni.p4.z > 0.5;
 
     int mode = int(uni.p0.x);
     int stereo = int(uni.p0.y);
@@ -155,10 +184,23 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         if (!valid) {
             continue;
         }
-        if (chromatic) {
-            rgb[ch] = video.sample(smp, uv)[ch];
+        float3 sampled;
+        if (hasVideo) {
+            if (uni.p4.w > 0.5) {
+                sampled = videoY.sample(smp, uv).rgb;
+            } else {
+                float yv = videoY.sample(smp, uv).r;
+                float2 cc = videoCbCr.sample(smp, uv).rg;
+                sampled = yuv_to_rgb(yv, cc, fullRange, bt2020);
+            }
         } else {
-            rgb = video.sample(smp, uv).rgb;
+            sampled = float3(0.16); // фон, когда файл не открыт
+        }
+
+        if (chromatic) {
+            rgb[ch] = sampled[ch];
+        } else {
+            rgb = sampled;
         }
     }
 
@@ -396,25 +438,73 @@ struct Uniforms {
     var p1: SIMD4<Float> // гироскоп в мировых осях (xyz) + длительность развёртки, с
     var p2: SIMD4<Float> // хроматика, панель видима, курсор uv
     var p3: SIMD4<Float> // панель: центр и полуразмеры в tan-пространстве
+    var p4: SIMD4<Float> // есть видео, полный диапазон YUV, BT.2020
 }
 
 // MARK: - Видео
 
 final class VideoSource {
     let player: AVPlayer
-    private let output: AVPlayerItemVideoOutput
+    private var output: AVPlayerItemVideoOutput
     private var textureCache: CVMetalTextureCache?
-    private(set) var texture: MTLTexture?
+    private(set) var textureY: MTLTexture?
+    private(set) var textureCbCr: MTLTexture?
+    private(set) var fullRange = false
+    private(set) var bt2020 = false
+    private(set) var isBGRA = false
     private(set) var audioDeviceID: AudioDeviceID?
     private var endObserver: NSObjectProtocol?
+    private let url: URL
+    var onUnsupported: ((String) -> Void)?
+    private var loggedFormat = false
+    private var noFrameSince = CACurrentMediaTime()
+    private var gotAnyFrame = false
+    // Не все файлы отдают кадры в запрошенном формате: если кадров нет,
+    // по очереди пробуем другие варианты
+    private var formatAttempt = 0
+
+    private enum OutputRecipe {
+        case attributes([String: Any]?)
+        case settings([String: Any])
+    }
+
+    private static let yuvFormats: [OSType] = [
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    ]
+
+    private static let formatAttempts: [OutputRecipe] = [
+        // Родной YUV: втрое меньше памяти, важно для 8K
+        .attributes([
+            kCVPixelBufferPixelFormatTypeKey as String: yuvFormats,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+        ]),
+        // MV-HEVC (стереовидео Apple/DeoVR): без явного запроса слоя
+        // декодер может не отдавать кадры вовсе
+        .settings([
+            kCVPixelBufferPixelFormatTypeKey as String: yuvFormats,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+            AVVideoDecompressionPropertiesKey: [
+                kVTDecompressionPropertyKey_RequestedMVHEVCVideoLayerIDs as String: [0],
+            ],
+        ]),
+        // Только 8-битный YUV
+        .attributes([
+            kCVPixelBufferPixelFormatTypeKey as String:
+                kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferMetalCompatibilityKey as String: true,
+        ]),
+        // Пусть система выберет сама
+        .attributes([kCVPixelBufferMetalCompatibilityKey as String: true]),
+        .attributes(nil),
+    ]
 
     init(url: URL, device: MTLDevice) {
+        self.url = url
         let item = AVPlayerItem(url: url)
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferMetalCompatibilityKey as String: true,
-        ]
-        output = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
+        output = Self.makeOutput(attempt: 0)
         item.add(output)
         player = AVPlayer(playerItem: item)
         player.actionAtItemEnd = .pause
@@ -422,11 +512,69 @@ final class VideoSource {
 
         // В конце файла — стоп и перемотка в начало (без повтора);
         // «Играть» запустит с начала
+        describeTracks(item.asset)
+
         endObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
             self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             print("[player] конец файла")
+        }
+    }
+
+    private func describeTracks(_ asset: AVAsset) {
+        Task {
+            guard let tracks = try? await asset.loadTracks(withMediaType: .video),
+                  let track = tracks.first else {
+                print("[video] Видеодорожка не найдена")
+                return
+            }
+            let size = (try? await track.load(.naturalSize)) ?? .zero
+            let fps = (try? await track.load(.nominalFrameRate)) ?? 0
+            let decodable = (try? await track.load(.isDecodable)) ?? false
+            let playable = (try? await track.load(.isPlayable)) ?? false
+            let formats = (try? await track.load(.formatDescriptions)) ?? []
+
+            var codec = "?"
+            var extra = ""
+            if let desc = formats.first {
+                let sub = CMFormatDescriptionGetMediaSubType(desc)
+                codec = String(bytes: [
+                    UInt8((sub >> 24) & 0xff), UInt8((sub >> 16) & 0xff),
+                    UInt8((sub >> 8) & 0xff), UInt8(sub & 0xff),
+                ], encoding: .ascii) ?? "?"
+
+                if let exts = CMFormatDescriptionGetExtensions(desc) as? [String: Any] {
+                    // Признак многослойного (стерео) HEVC
+                    if exts.keys.contains(where: { $0.contains("Heroes") || $0.contains("MVHEVC") }) {
+                        extra += ", MV-HEVC"
+                    }
+                    if let tags = exts["\(kCMFormatDescriptionExtension_ProjectionKind)"] {
+                        extra += ", проекция \(tags)"
+                    }
+                }
+                extra += ", слоёв: \(formats.count)"
+            }
+
+            print("[video] Дорожка: \(codec), \(Int(size.width))x\(Int(size.height)), "
+                + "\(String(format: "%.0f", fps)) fps, "
+                + "декодируется: \(decodable ? "да" : "НЕТ"), "
+                + "воспроизводима: \(playable ? "да" : "НЕТ")\(extra)")
+
+            // hev1 хранит параметры кодека внутри потока — AVFoundation такое
+            // не декодирует, нужна перепаковка в hvc1 (без пережатия)
+            if codec == "hev1" || !decodable {
+                let hint = codec == "hev1"
+                    ? "Формат hev1 не поддерживается macOS. Перепакуйте без потерь:"
+                    : "Видеодорожка не декодируется. Возможно, поможет перепаковка:"
+                print("[video] \(hint)")
+                print("[video]   tools/fix-hev1 \"\(self.url.path)\"")
+                await MainActor.run {
+                    self.onUnsupported?(codec == "hev1"
+                        ? "Формат hev1 не поддерживается — нужна перепаковка (см. лог)"
+                        : "Видео не декодируется (см. лог)")
+                }
+            }
         }
     }
 
@@ -538,20 +686,108 @@ final class VideoSource {
         return ok
     }
 
+    private static func makeOutput(attempt: Int) -> AVPlayerItemVideoOutput {
+        switch formatAttempts[attempt] {
+        case .attributes(let attrs):
+            if let attrs {
+                return AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
+            }
+            return AVPlayerItemVideoOutput(outputSettings: nil)
+        case .settings(let settings):
+            return AVPlayerItemVideoOutput(outputSettings: settings)
+        }
+    }
+
     func updateTexture() {
         let t = output.itemTime(forHostTime: CACurrentMediaTime())
-        guard output.hasNewPixelBuffer(forItemTime: t),
-              let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil),
-              let cache = textureCache else { return }
+        // Без проверки hasNewPixelBuffer: часть файлов отдаёт кадры,
+        // не сообщая о них через этот флаг
+        guard let pb = output.copyPixelBuffer(forItemTime: t, itemTimeForDisplay: nil),
+              let cache = textureCache else {
+            retryOtherFormatIfNeeded()
+            return
+        }
+        noFrameSince = CACurrentMediaTime()
+        gotAnyFrame = true
 
-        let w = CVPixelBufferGetWidth(pb)
-        let h = CVPixelBufferGetHeight(pb)
+        let format = CVPixelBufferGetPixelFormatType(pb)
+        let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        fullRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+
+        if let matrix = CVBufferGetAttachment(pb, kCVImageBufferYCbCrMatrixKey, nil)?
+            .takeUnretainedValue() as? NSString {
+            bt2020 = matrix == (kCVImageBufferYCbCrMatrix_ITU_R_2020 as NSString)
+        }
+
+        if !loggedFormat {
+            loggedFormat = true
+            let fourCC = String(bytes: [
+                UInt8((format >> 24) & 0xff), UInt8((format >> 16) & 0xff),
+                UInt8((format >> 8) & 0xff), UInt8(format & 0xff),
+            ], encoding: .ascii) ?? "?"
+            print("[video] \(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)) "
+                + "\(fourCC), \(tenBit ? "10 бит" : "8 бит"), "
+                + "\(fullRange ? "full" : "video") range, \(bt2020 ? "BT.2020" : "BT.709")")
+        }
+
+        // Непланарный кадр (BGRA) — читаем как RGB, YUV-преобразование не нужно
+        isBGRA = CVPixelBufferGetPlaneCount(pb) == 0
+        if isBGRA {
+            if let tex = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm) {
+                textureY = tex
+                textureCbCr = tex
+            }
+            return
+        }
+
+        let yFormat: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm
+        let cbcrFormat: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
+
+        if let y = makeTexture(pb, cache: cache, plane: 0, format: yFormat) {
+            textureY = y
+        }
+        if let cbcr = makeTexture(pb, cache: cache, plane: 1, format: cbcrFormat) {
+            textureCbCr = cbcr
+        }
+    }
+
+    private func makeTexture(_ pb: CVPixelBuffer, cache: CVMetalTextureCache,
+                             plane: Int, format: MTLPixelFormat) -> MTLTexture? {
+        let w = CVPixelBufferGetWidthOfPlane(pb, plane)
+        let h = CVPixelBufferGetHeightOfPlane(pb, plane)
         var cvTex: CVMetalTexture?
         let res = CVMetalTextureCacheCreateTextureFromImage(
-            nil, cache, pb, nil, .bgra8Unorm, w, h, 0, &cvTex)
-        if res == kCVReturnSuccess, let cvTex, let mtl = CVMetalTextureGetTexture(cvTex) {
-            texture = mtl
+            nil, cache, pb, nil, format, w, h, plane, &cvTex)
+        guard res == kCVReturnSuccess, let cvTex else {
+            print("[video] не удалось создать текстуру плоскости \(plane): код \(res)")
+            return nil
         }
+        return CVMetalTextureGetTexture(cvTex)
+    }
+
+    // Кадров нет — пробуем следующий формат пикселей
+    private func retryOtherFormatIfNeeded() {
+        guard !gotAnyFrame, player.rate != 0,
+              CACurrentMediaTime() - noFrameSince > 2,
+              let item = player.currentItem else { return }
+        noFrameSince = CACurrentMediaTime()
+
+        guard formatAttempt + 1 < Self.formatAttempts.count else {
+            print("[video] Кадры не поступают ни в одном из форматов. Статус: "
+                + "\(item.status.rawValue)"
+                + (item.error.map { ", ошибка: \($0.localizedDescription)" } ?? ""))
+            gotAnyFrame = true // больше не пробуем
+            return
+        }
+
+        formatAttempt += 1
+        item.remove(output)
+        output = Self.makeOutput(attempt: formatAttempt)
+        item.add(output)
+        loggedFormat = false
+        print("[video] Кадров нет — переключаюсь на формат №\(formatAttempt + 1)")
     }
 }
 
@@ -562,7 +798,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     let queue: MTLCommandQueue
     let pipeline: MTLRenderPipelineState
     let lutBuffer: MTLBuffer
-    let placeholder: MTLTexture
+    let placeholderY: MTLTexture
+    let placeholderCbCr: MTLTexture
     let tracker = HeadTracker()
     var video: VideoSource?
     var config: PlaybackConfig
@@ -597,13 +834,21 @@ final class Renderer: NSObject, MTKViewDelegate {
         lutBuffer = device.makeBuffer(
             bytes: psvr2_distortion_lut(), length: 1024 * 3 * 4, options: .storageModeShared)!
 
-        let texDesc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm, width: 2, height: 2, mipmapped: false)
-        texDesc.usage = [.shaderRead]
-        placeholder = device.makeTexture(descriptor: texDesc)!
-        var gray = [UInt8](repeating: 60, count: 2 * 2 * 4)
-        placeholder.replace(
-            region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: &gray, bytesPerRow: 8)
+        let yDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .r8Unorm, width: 2, height: 2, mipmapped: false)
+        yDesc.usage = [.shaderRead]
+        placeholderY = device.makeTexture(descriptor: yDesc)!
+        var luma = [UInt8](repeating: 40, count: 4)
+        placeholderY.replace(
+            region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: &luma, bytesPerRow: 2)
+
+        let cDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rg8Unorm, width: 2, height: 2, mipmapped: false)
+        cDesc.usage = [.shaderRead]
+        placeholderCbCr = device.makeTexture(descriptor: cDesc)!
+        var chroma = [UInt8](repeating: 128, count: 8)
+        placeholderCbCr.replace(
+            region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: &chroma, bytesPerRow: 4)
 
         super.init()
     }
@@ -684,13 +929,19 @@ final class Renderer: NSObject, MTKViewDelegate {
                 // Курсор показываем только с панелью (не с одной плашкой OSD)
                 Float((overlay?.active ?? false) ? overlay!.cursorU : -10),
                 Float((overlay?.active ?? false) ? overlay!.cursorV : -10)),
-            p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y))
+            p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y),
+            p4: SIMD4(
+                video?.textureY != nil ? 1 : 0,
+                (video?.fullRange ?? false) ? 1 : 0,
+                (video?.bt2020 ?? false) ? 1 : 0,
+                (video?.isBGRA ?? false) ? 1 : 0))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(video?.texture ?? placeholder, index: 0)
-        enc.setFragmentTexture(overlay?.texture ?? placeholder, index: 1)
+        enc.setFragmentTexture(video?.textureY ?? placeholderY, index: 0)
+        enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
+        enc.setFragmentTexture(video?.textureCbCr ?? placeholderCbCr, index: 2)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cmd.present(drawable)
@@ -897,6 +1148,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var keyMonitor: Any?
     var cvLink: CVDisplayLink?
     var playerView: PlayerView?
+    var accessHelperWindow: NSWindow?
     let videoURL: URL?
 
     init(videoURL: URL?) {
@@ -950,6 +1202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.warpPoint = CGPoint(x: screen.frame.midX, y: primaryHeight - screen.frame.midY)
         overlay.onOpenFile = { [weak self] url in
             self?.loadVideo(url)
+        }
+        overlay.onWindowLevelRequest = { [weak self] onTop in
+            onTop ? self?.hideAccessHelper() : self?.showAccessHelper()
         }
         renderer.overlay = overlay
 
@@ -1031,16 +1286,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         print("[player]             отладка: P предсказание · [/] упреждение · S развёртка · C хроматика")
     }
 
+    // Системный запрос доступа macOS показывает на экране активного окна.
+    // Наше окно — в шлеме, поэтому на время ожидания открываем окно-подсказку
+    // на обычном мониторе: диалог появится там же.
+    private func showAccessHelper() {
+        window.level = .normal
+        guard accessHelperWindow == nil else { return }
+
+        let deskScreen = NSScreen.screens.first { !$0.localizedName.localizedCaseInsensitiveContains("PS VR2") }
+            ?? NSScreen.main!
+        let size = NSSize(width: 520, height: 150)
+        let frame = NSRect(
+            x: deskScreen.frame.midX - size.width / 2,
+            y: deskScreen.frame.midY - size.height / 2,
+            width: size.width, height: size.height)
+
+        let helper = NSWindow(
+            contentRect: frame, styleMask: [.titled], backing: .buffered, defer: false,
+            screen: deskScreen)
+        helper.title = "PSVR2 Player — доступ к диску"
+        helper.level = .floating
+
+        let label = NSTextField(wrappingLabelWithString:
+            "Ожидание доступа к диску.\n\n"
+            + "Разрешите доступ в системном запросе, если он появился. "
+            + "Если запроса нет — нажмите кнопку ниже: откроются «Полный доступ к диску» "
+            + "и папка с приложением. Добавьте PSVR2Player.app кнопкой «+» и включите "
+            + "переключатель, затем повторите выбор диска.")
+        label.frame = NSRect(x: 20, y: 60, width: size.width - 40, height: size.height - 76)
+        label.font = .systemFont(ofSize: 13)
+        helper.contentView?.addSubview(label)
+
+        let button = NSButton(title: "Открыть настройки доступа", target: self,
+                              action: #selector(openFullDiskAccess))
+        button.frame = NSRect(x: 20, y: 16, width: 240, height: 32)
+        button.bezelStyle = .rounded
+        helper.contentView?.addSubview(button)
+
+        helper.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        accessHelperWindow = helper
+        print("[player] Открыто окно ожидания доступа на мониторе")
+    }
+
+    @objc private func openFullDiskAccess() {
+        if let url = URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+        print("[player] Полный доступ к диску → «+» → \(Bundle.main.bundleURL.path)")
+    }
+
+    private func hideAccessHelper() {
+        if let helper = accessHelperWindow {
+            helper.orderOut(nil)
+            accessHelperWindow = nil
+        }
+        window.level = .mainMenu + 1
+        window.makeKeyAndOrderFront(nil)
+        if let view = playerView {
+            window.makeFirstResponder(view)
+        }
+    }
+
     func loadVideo(_ url: URL) {
         guard let renderer else { return }
         renderer.video?.stop()
         let vs = VideoSource(url: url, device: renderer.device)
+        vs.onUnsupported = { [weak renderer] message in
+            renderer?.overlay?.showOSD(message, duration: 8)
+        }
         vs.routeAudioToHeadset()
         // Восстанавливаем сохранённую громкость
         if let saved = UserDefaults.standard.object(forKey: "volume") as? Float {
             vs.player.volume = max(0, min(1, saved))
         }
         renderer.video = vs
+        renderer.overlay?.setCurrentFile(url)
         renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
         vs.player.play()
         let config = renderer.config

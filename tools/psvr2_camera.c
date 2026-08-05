@@ -1,30 +1,28 @@
 /*
- * psvr2_camera — проверка доступа к камерам PSVR2 (passthrough) через
- * PC-адаптер и дамп кадров в файл.
+ * psvr2_camera — попытка получить кадры камер PSVR2 (passthrough) через
+ * PC-адаптер и дамп найденного в файл.
  *
  * Протокол из PSVR2Toolkit (BnuuySolutions):
  * https://github.com/BnuuySolutions/PSVR2Toolkit
  *   - включение камер: vendor control 0x09, report_id 0x0B,
  *     данные {1,0,0,0, 0x10, 0,0,0} (0x05 вместо 0x10 — выключить)
- *   - кадры приходят пакетами с сигнатурой 'V','I': заголовок 256 байт
- *     (image_type 11 — passthrough BC4 1024x1016, 6 — картинка глаз)
+ *   - кадры: сигнатура 'V','I', заголовок 256 байт,
+ *     image_type 11 — passthrough BC4 1024x1016, 6 — картинка глаз
+ *   - поток взгляда рядом: report_id 0x0C, интерфейс 5 EP 0x85
  *
- * Ищем поток кадров перебором интерфейсов/эндпоинтов: на macOS номера
- * могут отличаться от Windows-драйвера Sony.
+ * Команда включения, по опыту Toolkit, «не прилипает» — шлём повторно.
+ * Перебираем все интерфейсы, альтернативные настройки и IN-эндпоинты,
+ * печатаем сигнатуры всех найденных потоков (не только VI).
  */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <ctype.h>
 #include <signal.h>
 #include <libusb.h>
 
 #define PSVR2_VID 0x054C
 #define PSVR2_PID 0x0CDE
-
-/* Интерфейс/эндпоинт потока изображений: подбираются перебором */
-static const struct { int intf; int ep; } candidates[] = {
-	{4, 0x84}, {6, 0x87}, {10, 0x8b}, {12, 0x8d}, {8, 0x89}, {9, 0x8a}, {11, 0x8c},
-};
 
 #pragma pack(push, 1)
 struct image_data_hdr {
@@ -38,7 +36,6 @@ struct image_data_hdr {
 	uint32_t custom_data_size;
 	uint8_t unk2[20];
 	uint8_t unk3[192];
-	/* дальше data[] */
 };
 
 struct control_payload {
@@ -54,19 +51,80 @@ struct control_payload {
 static volatile sig_atomic_t stop = 0;
 static void on_sigint(int sig) { (void)sig; stop = 1; }
 
-static int camera_power(libusb_device_handle *dev, int on)
+static int send_cmd(libusb_device_handle *dev, uint8_t report_id,
+                    const uint8_t *data, uint16_t len)
 {
 	struct control_payload p;
 	memset(&p, 0, sizeof(p));
-	p.report_id = 0x0B;
+	p.report_id = report_id;
 	p.subcmd = 1;
-	p.length = 8;
-	p.data[0] = 1;
-	p.data[4] = on ? 0x10 : 0x05;
-
+	p.length = len;
+	if (data != NULL && len > 0) {
+		memcpy(p.data, data, len);
+	}
 	int ret = libusb_control_transfer(dev, 0x42, 0x09, 0, 0,
-	                                  (unsigned char *)&p, 8 + 8, 2000);
+	                                  (unsigned char *)&p, len + 8, 2000);
 	return ret < 0 ? ret : 0;
+}
+
+static void camera_power(libusb_device_handle *dev, int on)
+{
+	uint8_t data[8] = {1, 0, 0, 0, (uint8_t)(on ? 0x10 : 0x05), 0, 0, 0};
+	send_cmd(dev, 0x0B, data, sizeof(data));
+}
+
+/* Слушаем эндпоинт, печатаем встреченные сигнатуры пакетов */
+static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
+                     const char *outPath, int *foundVI)
+{
+	static uint8_t buf[1048576];
+	int packets = 0;
+	char seen[8][3] = {{0}};
+	int seen_n = 0;
+
+	for (int i = 0; i < tries && !stop; i++) {
+		int transferred = 0;
+		int ret = (type == LIBUSB_TRANSFER_TYPE_BULK)
+		    ? libusb_bulk_transfer(dev, ep, buf, sizeof(buf), &transferred, 250)
+		    : libusb_interrupt_transfer(dev, ep, buf, sizeof(buf), &transferred, 250);
+		if (ret != 0 || transferred < 4) {
+			continue;
+		}
+		packets++;
+
+		char sig[3] = {isprint(buf[0]) ? buf[0] : '.', isprint(buf[1]) ? buf[1] : '.', 0};
+		int known = 0;
+		for (int s = 0; s < seen_n; s++) {
+			if (strcmp(seen[s], sig) == 0) { known = 1; break; }
+		}
+		if (!known && seen_n < 8) {
+			strcpy(seen[seen_n++], sig);
+		}
+
+		if (buf[0] == 'V' && buf[1] == 'I' && transferred > (int)sizeof(struct image_data_hdr)) {
+			struct image_data_hdr *h = (struct image_data_hdr *)buf;
+			printf("      >>> VI-кадр! тип %u, размер %u, пакет %d байт\n",
+			       h->image_type, h->total_size, transferred);
+			if (outPath != NULL && !*foundVI) {
+				FILE *f = fopen(outPath, "wb");
+				if (f != NULL) {
+					fwrite(buf, 1, transferred, f);
+					fclose(f);
+					printf("      >>> сохранён в %s\n", outPath);
+				}
+			}
+			*foundVI = 1;
+		}
+	}
+
+	if (packets > 0) {
+		printf("      %d пакетов, сигнатуры:", packets);
+		for (int s = 0; s < seen_n; s++) {
+			printf(" '%s'", seen[s]);
+		}
+		printf("\n");
+	}
+	return packets;
 }
 
 int main(int argc, char **argv)
@@ -82,66 +140,57 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	int ret = camera_power(dev, 1);
-	printf("Команда включения камер (0x0B): %s\n",
-	       ret == 0 ? "отправлена" : libusb_error_name(ret));
+	/* Взгляд и камеры включаем оба: image_type 6 идёт вместе с потоком глаз */
+	send_cmd(dev, 0x0C, NULL, 0);
+	camera_power(dev, 1);
+	printf("Команды включения отправлены (0x0C взгляд, 0x0B камеры)\n\n");
 
-	static uint8_t buf[1048576];
-	int found = 0;
-
-	for (size_t c = 0; c < sizeof(candidates) / sizeof(candidates[0]) && !stop; c++) {
-		int intf = candidates[c].intf, ep = candidates[c].ep;
-		if (libusb_claim_interface(dev, intf) != 0) {
-			printf("intf %2d: занят\n", intf);
-			continue;
-		}
-
-		int packets = 0, vi = 0;
-		long long bytes = 0;
-		uint16_t types = 0;
-		for (int i = 0; i < 60 && !stop; i++) {
-			int transferred = 0;
-			ret = libusb_bulk_transfer(dev, ep, buf, sizeof(buf), &transferred, 300);
-			if (ret != 0 || transferred <= 0) {
-				continue;
-			}
-			packets++;
-			bytes += transferred;
-			if (transferred > (int)sizeof(struct image_data_hdr)) {
-				struct image_data_hdr *h = (struct image_data_hdr *)buf;
-				if (h->magic[0] == 'V' && h->magic[1] == 'I') {
-					vi++;
-					types = h->image_type;
-					if (vi == 1) {
-						printf("  >>> VI-кадр! тип %u, размер %u, ts %u, пакет %d байт\n",
-						       h->image_type, h->total_size, h->timestamp, transferred);
-						if (outPath != NULL) {
-							FILE *f = fopen(outPath, "wb");
-							if (f != NULL) {
-								fwrite(buf, 1, transferred, f);
-								fclose(f);
-								printf("  >>> кадр сохранён в %s\n", outPath);
-							}
-						}
-						found = 1;
-					}
-				}
-			}
-		}
-		printf("intf %2d EP 0x%02x: %d пакетов, %lld байт, VI-кадров %d%s\n",
-		       intf, ep, packets, bytes, vi,
-		       vi ? "" : (packets ? " (другой формат)" : " (тишина)"));
-		if (vi > 0) {
-			printf("       последний image_type: %u\n", types);
-		}
-		libusb_release_interface(dev, intf);
+	libusb_device *d = libusb_get_device(dev);
+	struct libusb_config_descriptor *cfg;
+	if (libusb_get_active_config_descriptor(d, &cfg) < 0) {
+		fprintf(stderr, "config descriptor недоступен\n");
+		return 1;
 	}
 
-	printf("\n%s\n", found
+	int foundVI = 0;
+	for (int i = 0; i < cfg->bNumInterfaces && !stop; i++) {
+		const struct libusb_interface *itf = &cfg->interface[i];
+		int num = itf->altsetting[0].bInterfaceNumber;
+		if (libusb_claim_interface(dev, num) != 0) {
+			continue;
+		}
+		for (int a = 0; a < itf->num_altsetting && !stop; a++) {
+			const struct libusb_interface_descriptor *alt = &itf->altsetting[a];
+			if (alt->bNumEndpoints == 0) {
+				continue;
+			}
+			if (libusb_set_interface_alt_setting(dev, num, alt->bAlternateSetting) < 0) {
+				continue;
+			}
+			/* Команда «не прилипает»: повторяем на каждой настройке */
+			camera_power(dev, 1);
+			for (int e = 0; e < alt->bNumEndpoints; e++) {
+				const struct libusb_endpoint_descriptor *ep = &alt->endpoint[e];
+				int type = ep->bmAttributes & 0x3;
+				if (!(ep->bEndpointAddress & LIBUSB_ENDPOINT_IN)
+				    || (type != LIBUSB_TRANSFER_TYPE_BULK
+				        && type != LIBUSB_TRANSFER_TYPE_INTERRUPT)) {
+					continue;
+				}
+				printf("intf %2d alt %d EP 0x%02x:\n", num, alt->bAlternateSetting,
+				       ep->bEndpointAddress);
+				listen_ep(dev, ep->bEndpointAddress, type, 40, outPath, &foundVI);
+			}
+		}
+		libusb_release_interface(dev, num);
+	}
+
+	printf("\n%s\n", foundVI
 	    ? "=== КАДРЫ КАМЕР ДОСТУПНЫ ==="
 	    : "=== VI-кадров не найдено ===");
 
 	camera_power(dev, 0);
+	libusb_free_config_descriptor(cfg);
 	libusb_close(dev);
 	libusb_exit(ctx);
 	return 0;

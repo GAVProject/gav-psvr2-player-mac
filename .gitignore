@@ -3,6 +3,10 @@
 player/psvr2player
 player/PSVR2Player.app
 tools/psvr2_probe
+tools/psvr2_scan
+tools/psvr2_gaze
+tools/psvr2_camera
+tools/psvr2_dump
 
 # Артефакты запуска
 psvr2_calibration.bin

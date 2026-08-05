@@ -83,7 +83,9 @@ static int g_proximity;
 static int g_function_button;
 static int g_ipd_mm = 63;
 
-/* Камеры: двойная буферизация кадра под общим мьютексом */
+/* Камеры: свой мьютекс — копирование кадра (1 МБ) не должно задерживать
+ * чтение позы и IMU под общим g_lock */
+static pthread_mutex_t g_camera_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_camera_thread;
 static volatile int g_camera_running;
 static unsigned char *g_camera_frame; /* две BC4-плоскости подряд */
@@ -497,12 +499,12 @@ static void *camera_thread_fn(void *arg)
 			continue;
 		}
 
-		pthread_mutex_lock(&g_lock);
+		pthread_mutex_lock(&g_camera_lock);
 		if (g_camera_frame != NULL) {
 			memcpy(g_camera_frame, buf + CAMERA_HEADER_BYTES, 2 * PSVR2_CAM_PLANE_BYTES);
 			g_camera_seq++;
 		}
-		pthread_mutex_unlock(&g_lock);
+		pthread_mutex_unlock(&g_camera_lock);
 	}
 
 	free(buf);
@@ -524,13 +526,13 @@ int psvr2_camera_start(void)
 		return -1;
 	}
 
-	pthread_mutex_lock(&g_lock);
+	pthread_mutex_lock(&g_camera_lock);
 	if (g_camera_frame == NULL) {
 		g_camera_frame = malloc(2 * PSVR2_CAM_PLANE_BYTES);
 	}
 	g_camera_seq = 0;
 	g_camera_seq_taken = 0;
-	pthread_mutex_unlock(&g_lock);
+	pthread_mutex_unlock(&g_camera_lock);
 
 	if (g_camera_frame == NULL) {
 		libusb_release_interface(g_dev, CAMERA_INTERFACE);
@@ -564,13 +566,13 @@ void psvr2_camera_stop(void)
 int psvr2_camera_get_frame(unsigned char *left, unsigned char *right)
 {
 	int fresh = 0;
-	pthread_mutex_lock(&g_lock);
+	pthread_mutex_lock(&g_camera_lock);
 	if (g_camera_frame != NULL && g_camera_seq != g_camera_seq_taken) {
 		g_camera_seq_taken = g_camera_seq;
 		memcpy(left, g_camera_frame, PSVR2_CAM_PLANE_BYTES);
 		memcpy(right, g_camera_frame + PSVR2_CAM_PLANE_BYTES, PSVR2_CAM_PLANE_BYTES);
 		fresh = 1;
 	}
-	pthread_mutex_unlock(&g_lock);
+	pthread_mutex_unlock(&g_camera_lock);
 	return fresh;
 }

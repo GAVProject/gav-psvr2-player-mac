@@ -1567,7 +1567,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 610)
+        let size = NSSize(width: 620, height: 632)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -1645,7 +1645,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let footer = NSTextField(wrappingLabelWithString:
             "Кнопка Fn: одиночное — рецентр · двойное — вид с камер · долгое — центр по взгляду\n"
-            + "R — рецентр · Q — выход · мышь в шлеме: движение — панель, ПКМ — наклон, колесо — список")
+            + "Мышь: движение — панель · клик — выбор · ПКМ с ведением — наклон сцены · колесо — список\n"
+            + "Тачпад: то же самое — два пальца листают список, нажатие двумя пальцами "
+            + "с ведением наклоняет сцену")
         footer.font = .systemFont(ofSize: 11.5)
         footer.textColor = .tertiaryLabelColor
 

@@ -362,6 +362,9 @@ void psvr2_stop(void)
 	if (!g_running) {
 		return;
 	}
+	/* Поток камер работает с g_dev — глушим его до закрытия устройства,
+	 * заодно выключаем камеры в шлеме */
+	psvr2_camera_stop();
 	g_running = 0;
 	pthread_join(g_slam_thread, NULL);
 	pthread_join(g_status_thread, NULL);

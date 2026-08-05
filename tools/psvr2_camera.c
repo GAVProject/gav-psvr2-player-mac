@@ -105,12 +105,17 @@ static int listen_ep(libusb_device_handle *dev, int ep, int type, int tries,
 			struct image_data_hdr *h = (struct image_data_hdr *)buf;
 			printf("      >>> VI-кадр! тип %u, размер %u, пакет %d байт\n",
 			       h->image_type, h->total_size, transferred);
-			if (outPath != NULL && !*foundVI) {
-				FILE *f = fopen(outPath, "wb");
+			static int saved = 0;
+			if (outPath != NULL && saved < 6) {
+				char path[512];
+				snprintf(path, sizeof(path), "%s.%d", outPath, saved);
+				FILE *f = fopen(path, "wb");
 				if (f != NULL) {
 					fwrite(buf, 1, transferred, f);
 					fclose(f);
-					printf("      >>> сохранён в %s\n", outPath);
+					printf("      >>> кадр %d: %s (hdr %02x %02x %02x %02x %02x %02x)\n",
+					       saved, path, buf[16], buf[17], buf[18], buf[19], buf[20], buf[21]);
+					saved++;
 				}
 			}
 			*foundVI = 1;

@@ -23,6 +23,27 @@ final class PassthroughSource {
     var fovDeg: Float = 150
     var brightness: Float = 1.6
 
+    // Камеры разнесены шире глаз, поэтому стерео получается преувеличенным
+    // («гиперстерео») и сводится с трудом. Клавиша M переключает режим,
+    // моно — гарантированно комфортный вариант.
+    enum Source: Int32, CaseIterable {
+        case stereo = 2, mono0 = 0, mono1 = 1
+
+        var label: String {
+            switch self {
+            case .stereo: return "стерео"
+            case .mono0: return "моно (левая камера)"
+            case .mono1: return "моно (правая камера)"
+            }
+        }
+    }
+    var source = Source.stereo
+
+    // Конвергенция: сдвиг картинок навстречу друг другу в долях кадра.
+    // Компенсирует разнос камер (он заметно шире межзрачкового расстояния).
+    // 0.100 подобрано на живом просмотре; правится клавишами «,» и «.»
+    var convergence: Float = 0.100
+
     private var bufL = [UInt8](repeating: 0, count: planeBytes)
     private var bufR = [UInt8](repeating: 0, count: planeBytes)
 

@@ -45,7 +45,8 @@ struct Uniforms {
     float4 p2;       // x: хроматика, y: панель UI видима, zw: курсор (uv текстуры панели)
     float4 p3;       // панель в tan-пространстве: центр (xy), полуразмеры (zw)
     float4 p4;       // x: есть видео, y: полный диапазон YUV, z: BT.2020, w: кадр BGRA
-    float4 p5;       // x: passthrough вкл, y: FOV камер (рад), z: яркость
+    float4 p5;       // x: passthrough вкл, y: FOV камер (рад), z: яркость, w: режим камер
+    float4 p6;       // x: конвергенция камер (доли кадра)
 };
 
 constant float FX = 0.3585564;
@@ -224,11 +225,19 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             float2 xy = dir.xy;
             float len = length(xy);
             float2 d = len > 1e-6 ? xy / len : float2(0.0);
+            // p5.w: 0 — левая камера на оба глаза, 1 — правая, 2 — стерео.
+            // p6.x — конвергенция: сдвиг картинок навстречу, компенсирует
+            // разнос камер (он шире межзрачкового)
+            int camMode = int(uni.p5.w);
+            bool stereoMode = camMode == 2;
+            bool useR = camMode == 1 || (stereoMode && eye == 1);
+            float shift = stereoMode ? (eye == 0 ? uni.p6.x : -uni.p6.x) : 0.0;
+
             // Кадр 1016x1016 лежит в текстуре шириной 1024
-            float u = (0.5 + r * d.x) * (1016.0 / 1024.0);
+            float u = (0.5 + r * d.x + shift) * (1016.0 / 1024.0);
             float v = 0.5 - r * d.y;
-            float g = eye == 0 ? camL.sample(smp, float2(u, v)).r
-                               : camR.sample(smp, float2(u, v)).r;
+            float g = useR ? camR.sample(smp, float2(u, v)).r
+                           : camL.sample(smp, float2(u, v)).r;
             rgb = float3(saturate(g * uni.p5.z));
         } else {
             rgb = float3(0.0);
@@ -487,7 +496,8 @@ struct Uniforms {
     var p2: SIMD4<Float> // хроматика, панель видима, курсор uv
     var p3: SIMD4<Float> // панель: центр и полуразмеры в tan-пространстве
     var p4: SIMD4<Float> // есть видео, полный диапазон YUV, BT.2020
-    var p5: SIMD4<Float> // passthrough вкл, FOV камер (рад), яркость
+    var p5: SIMD4<Float> // passthrough вкл, FOV камер (рад), яркость, режим камер
+    var p6: SIMD4<Float> // конвергенция камер
 }
 
 // MARK: - Видео
@@ -1118,7 +1128,8 @@ final class Renderer: NSObject, MTKViewDelegate {
                 (passthrough?.gotFrame ?? false) ? 1 : 0,
                 (passthrough?.fovDeg ?? 150) * .pi / 180,
                 passthrough?.brightness ?? 1.6,
-                0))
+                Float(passthrough?.source.rawValue ?? 0)),
+            p6: SIMD4(passthrough?.convergence ?? 0, 0, 0, 0))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -1198,6 +1209,18 @@ final class PlayerView: MTKView {
             print("[player] вертикальный флип: \(r.config.flipV < 0 ? "вкл" : "выкл")")
         case 11: // B — вид с камер шлема
             r.togglePassthrough()
+        case 46: // M — режим камер: стерео / моно левая / моно правая
+            guard let pt = r.passthrough, pt.active else { break }
+            let all = PassthroughSource.Source.allCases
+            pt.source = all[(all.firstIndex(of: pt.source)! + 1) % all.count]
+            r.overlay?.showOSD(pt.source.label)
+            print("[passthrough] режим: \(pt.source.label)")
+        case 43, 47: // «,» и «.» — сведение картинок (компенсация разноса камер)
+            guard let pt = r.passthrough, pt.active else { break }
+            pt.convergence = max(-0.15, min(0.15,
+                pt.convergence + (event.keyCode == 47 ? 0.005 : -0.005)))
+            r.overlay?.showOSD(String(format: "Сведение: %+.3f", pt.convergence))
+            print(String(format: "[passthrough] сведение: %+.3f", pt.convergence))
         case 123: // ←
             seek(by: -15)
         case 124: // →

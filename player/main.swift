@@ -371,6 +371,23 @@ final class HeadTracker {
         offsetCurrent = offsetTarget
     }
 
+    // Полный рецентр (долгое нажатие Fn): центр видео — ровно туда, куда
+    // сейчас направлен взгляд, включая наклон головы. Для просмотра лёжа
+    func requestFullRecenter() {
+        guard let q = currentOrientation() else {
+            requestRecenter()
+            return
+        }
+        let f = q.act(SIMD3<Float>(0, 0, -1))
+        let yaw = atan2(-f.x, -f.z)
+        recenter = simd_quatf(angle: -yaw, axis: SIMD3<Float>(0, 1, 0))
+        didAutoRecenter = true
+        // Компенсируем наклон головы ручным наклоном сцены
+        manualPitch = max(-1.4, min(1.4, -asin(max(-1, min(1, f.y)))))
+        offsetTarget = simd_quatf(angle: manualPitch, axis: SIMD3<Float>(1, 0, 0))
+        offsetCurrent = offsetTarget
+    }
+
     func addManualRotation(dxPx: Double, dyPx: Double) {
         _ = dxPx // горизонталь намеренно игнорируется
         let sens: Float = 0.002 // рад на пиксель (~0.11°)
@@ -890,6 +907,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private var lastButton = false
+    private var buttonDownTime = 0.0
+    private var buttonLongFired = false
     // Автопауза по датчику приближения (шлем снят/надет), с дебаунсом
     private var wornState = true
     private var lastProxRaw = true
@@ -946,9 +965,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        // Кнопка Fn на шлеме — рецентр (по фронту нажатия)
+        // Кнопка Fn на шлеме: короткое нажатие — рецентр (горизонт сохраняется),
+        // долгое (>0.8 с) — центр видео точно по направлению взгляда
         let button = psvr2_get_button() == 1
+        let nowBtn = CACurrentMediaTime()
         if button && !lastButton {
+            buttonDownTime = nowBtn
+            buttonLongFired = false
+        }
+        if button && !buttonLongFired && nowBtn - buttonDownTime > 0.8 {
+            buttonLongFired = true
+            tracker.requestFullRecenter()
+            overlay?.showOSD("Центр — по направлению взгляда")
+            print("[player] полный рецентр (долгое нажатие кнопки шлема)")
+        }
+        if !button && lastButton && !buttonLongFired {
             tracker.requestRecenter()
             print("[player] рецентр (кнопка шлема)")
         }

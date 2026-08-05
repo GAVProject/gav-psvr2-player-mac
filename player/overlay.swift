@@ -117,6 +117,14 @@ final class UIOverlay {
     // Что показывать в шейдере: панель и/или плашку OSD
     var displayVisible: Bool { active || osdActive }
 
+    // Немедленно убрать плашку (вход в режим камер — картинка без интерфейса)
+    func clearOSD() {
+        osdUntil = 0
+        osdText = nil
+        osdDirty = true
+        redrawSoon()
+    }
+
     func showOSD(_ text: String, duration: Double = 1.5) {
         osdText = text
         osdUntil = CACurrentMediaTime() + duration
@@ -404,7 +412,9 @@ final class UIOverlay {
             if active && !rightHeld {
                 cursorU = min(1, max(0, cursorU + Double(dx) / 900.0))
                 cursorV = min(1, max(0, cursorV + Double(dy) / 450.0))
-            } else if !active && !rightHeld {
+            } else if !active && !rightHeld && renderer?.passthrough?.active != true {
+                // В режиме камер интерфейса нет вовсе: панель не появляется
+                // и мышь не перехватывается — можно просто осмотреться
                 show()
             }
         }

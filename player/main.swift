@@ -974,7 +974,6 @@ final class Renderer: NSObject, MTKViewDelegate {
                 pausedByPassthrough = false
                 video?.player.rate = playbackRate
             }
-            overlay?.showOSD("К видео")
             return
         }
         guard pt.start() else {
@@ -985,7 +984,9 @@ final class Renderer: NSObject, MTKViewDelegate {
             p.pause()
             pausedByPassthrough = true
         }
-        overlay?.showOSD("Вид с камер — двойное нажатие Fn или B, чтобы вернуться", duration: 3)
+        // Никаких плашек и панели поверх камер: чистый вид на комнату
+        overlay?.hide()
+        overlay?.clearOSD()
     }
 
     // Закрепить панель перед текущим взглядом (горизонт сохраняем)

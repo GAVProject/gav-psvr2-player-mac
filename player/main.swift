@@ -354,40 +354,29 @@ final class HeadTracker {
         return (correction * mapped).normalized
     }
 
-    // Ручной поворот вида (перетаскивание сцены правой кнопкой).
-    // Накапливается как жёсткий поворот сцены: между перетаскиваниями сцена
-    // неподвижна (поворот головы ничего не «подплывает»), а каждый шажок
-    // применяется вокруг текущих осей взгляда — рысканье вокруг вертикали,
-    // наклон вокруг горизонтальной оси поперёк взгляда, крен не возникает.
+    // Ручная подстройка вида (перетаскивание сцены правой кнопкой):
+    // только наклон вперёд/назад. Горизонтальное выравнивание делает рецентр,
+    // а ручное рысканье в сочетании с наклоном геометрически рождает крен
+    // и «перелёт через полюс» — поэтому его нет.
     // Мышь задаёт цель, кадры плавно подтягиваются slerp-доводчиком
     private var offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     private var offsetCurrent = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-    private var lastBase = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+    private var manualPitch: Float = 0
     private var lastSmoothTime = CACurrentMediaTime()
 
     func requestRecenter() {
         didAutoRecenter = false
+        manualPitch = 0
         offsetTarget = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
         offsetCurrent = offsetTarget
     }
 
     func addManualRotation(dxPx: Double, dyPx: Double) {
+        _ = dxPx // горизонталь намеренно игнорируется
         let sens: Float = 0.002 // рад на пиксель (~0.11°)
-        var t = simd_quatf(angle: Float(dxPx) * sens, axis: SIMD3<Float>(0, 1, 0)) * offsetTarget
-
-        // Наклон вокруг горизонтальной оси, перпендикулярной текущему взгляду
-        let f = (t * lastBase).act(SIMD3<Float>(0, 0, -1))
-        var right = SIMD3<Float>(-f.z, 0, f.x)
-        let len = simd_length(right)
-        if len > 1e-4 {
-            right /= len
-            let tilted = simd_quatf(angle: Float(dyPx) * sens, axis: right) * t
-            let f2 = (tilted * lastBase).act(SIMD3<Float>(0, 0, -1))
-            if abs(f2.y) < 0.985 { // ограничение наклона ~±80°
-                t = tilted
-            }
-        }
-        offsetTarget = t.normalized
+        // Наклон ограничен ~±80°
+        manualPitch = max(-1.4, min(1.4, manualPitch + Float(dyPx) * sens))
+        offsetTarget = simd_quatf(angle: manualPitch, axis: SIMD3<Float>(1, 0, 0))
     }
 
     private func smoothManual() {
@@ -423,8 +412,7 @@ final class HeadTracker {
         }
 
         smoothManual()
-        lastBase = recenter * q
-        let view = offsetCurrent * lastBase
+        let view = offsetCurrent * recenter * q
         viewQuat = view
 
         var gyro = [Float](repeating: 0, count: 3)
@@ -517,6 +505,8 @@ final class VideoSource {
     init(url: URL, device: MTLDevice) {
         self.url = url
         let item = AVPlayerItem(url: url)
+        // Без пережатия высоты тона звук на скоростях ≠ 1× превращается в писк
+        item.audioTimePitchAlgorithm = .timeDomain
         output = Self.makeOutput(attempt: 0)
         item.add(output)
         player = AVPlayer(playerItem: item)
@@ -532,6 +522,28 @@ final class VideoSource {
         ) { [weak self] _ in
             self?.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero)
             print("[player] конец файла")
+            if let self {
+                ResumeStore.set(nil, for: self.url) // досмотрен — с начала
+            }
+        }
+
+        // Периодически запоминаем позицию, чтобы продолжить с неё в другой раз
+        saveTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.savePosition()
+        }
+    }
+
+    private var saveTimer: Timer?
+
+    func savePosition() {
+        guard let item = player.currentItem, item.duration.isNumeric else { return }
+        let t = player.currentTime().seconds
+        let d = item.duration.seconds
+        guard t.isFinite, d > 60 else { return } // короткие ролики не запоминаем
+        if t > 15 && t < d - 30 {
+            ResumeStore.set(t, for: url)
+        } else if t >= d - 30 {
+            ResumeStore.set(nil, for: url)
         }
     }
 
@@ -593,6 +605,9 @@ final class VideoSource {
 
     // Явная остановка при замене файла
     func stop() {
+        savePosition()
+        saveTimer?.invalidate()
+        saveTimer = nil
         player.pause()
         player.replaceCurrentItem(with: nil)
         if let endObserver {
@@ -603,6 +618,9 @@ final class VideoSource {
 
     deinit {
         stop()
+        // Диагностика: если эта строка не появляется при смене файла —
+        // старый источник кто-то держит
+        print("[video] источник освобождён: \(url.lastPathComponent)")
     }
 
     func routeAudioToHeadset() {
@@ -820,6 +838,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     var chromaticEnabled = true
     var scanlineEnabled = true
     var overlay: UIOverlay!
+    // Скорость воспроизведения; при открытии нового файла сбрасывается на 1×
+    var playbackRate: Float = 1.0
     // Панель UI в tan-пространстве: центр и полуразмеры (аспект 2:1 как текстура)
     let panelCenter = SIMD2<Float>(0, -0.05)
     let panelHalf = SIMD2<Float>(0.5, 0.25)
@@ -877,6 +897,15 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var autoPaused = false
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
+
+    func setPlaybackRate(_ v: Float) {
+        playbackRate = v
+        if let p = video?.player, p.rate != 0 {
+            p.rate = v
+        }
+        overlay?.showOSD(String(format: "Скорость %g×", v))
+        print(String(format: "[player] скорость: %g×", v))
+    }
 
     // Закрепить панель перед текущим взглядом (горизонт сохраняем)
     func anchorPanel() {
@@ -999,11 +1028,24 @@ final class Renderer: NSObject, MTKViewDelegate {
         if now - statLastReport >= 2.0 {
             let fps = Double(statFrames) / (now - statLastReport)
             let gpuMs = statFrames > 0 ? statGpuTime / Double(statFrames) * 1000 : 0
-            print(String(format: "[stat] fps=%.1f gpu=%.2fмс (бюджет 8.3мс на 120Гц)", fps, gpuMs))
+            print(String(format: "[stat] fps=%.1f gpu=%.2fмс mem=%.0fМБ", fps, gpuMs, Self.memoryFootprintMB()))
             statFrames = 0
             statGpuTime = 0
             statLastReport = now
         }
+    }
+
+    // Физическая память процесса — для отлова утечек по логу
+    private static func memoryFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<Int32>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1048576 : 0
     }
 }
 
@@ -1022,6 +1064,7 @@ final class PlayerView: MTKView {
         case 12, 53: // Q, Esc
             print("[player] выход")
             r.overlay?.hide() // вернуть системный курсор
+            r.video?.savePosition()
             r.video?.player.pause()
             psvr2_stop()
             exit(0)
@@ -1112,8 +1155,12 @@ final class PlayerView: MTKView {
     }
 
     private func togglePause() {
-        guard let p = renderer?.video?.player else { return }
-        p.rate == 0 ? p.play() : p.pause()
+        guard let r = renderer, let p = r.video?.player else { return }
+        if p.rate == 0 {
+            p.rate = r.playbackRate
+        } else {
+            p.pause()
+        }
         print("[player] \(p.rate == 0 ? "пауза" : "воспроизведение")")
     }
 
@@ -1510,7 +1557,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderer.video = vs
         renderer.overlay?.setCurrentFile(url)
         renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
-        vs.player.play()
+        renderer.playbackRate = 1.0 // скорость — ситуативная, новый файл с 1×
+
+        // Продолжаем с прошлого места, если файл уже смотрели
+        if let resume = ResumeStore.position(for: url), resume > 15 {
+            vs.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600),
+                           toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+            let s = Int(resume)
+            let ts = s >= 3600
+                ? String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+                : String(format: "%d:%02d", s / 60, s % 60)
+            renderer.overlay?.showOSD("Продолжаю с \(ts)", duration: 3)
+            print("[player] продолжаю с \(ts)")
+        }
+
+        vs.player.rate = renderer.playbackRate
         let config = renderer.config
         print("[player] Файл: \(url.lastPathComponent)")
         print("[player] Проекция: \(config.projection.label), \(config.stereo.label)"
@@ -1518,6 +1579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        renderer?.video?.savePosition()
         renderer?.overlay?.hide()
         if let link = cvLink {
             CVDisplayLinkStop(link)

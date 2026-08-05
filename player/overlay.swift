@@ -25,7 +25,7 @@ final class UIOverlay {
     static let texW = 1024
     static let texH = 512
 
-    private enum PanelMode { case controls, picker }
+    private enum PanelMode { case controls, picker, format }
 
     private enum ButtonAction {
         case ui(UIAction)
@@ -33,6 +33,11 @@ final class UIOverlay {
         case pickerUp, pickerDown, pickerCancel, pickerDrives
         case showPicker
         case timeline
+        // Подменю «Формат»: явный выбор вместо циклирования
+        case showFormat, formatDone
+        case setProjection(Projection), setStereo(StereoLayout), setSpeed(Float)
+        case toggleFlip, fovDown, fovUp
+        case cycleSpeed
     }
 
     private struct Button {
@@ -72,6 +77,12 @@ final class UIOverlay {
     private var pickerScroll = 0
     private let pickerRows = 6
     private let videoExtensions: Set<String> = ["mp4", "m4v", "mov"]
+
+    // Миниатюры и метаданные видеофайлов для списка
+    private let metaCache = VideoMetaCache()
+
+    // Подписи слева от рядов подменю «Формат»
+    private var formatLabels: [(text: () -> String, rect: CGRect)] = []
 
     // Последний открытый файл — подсвечиваем в списке
     private var currentFile: URL?
@@ -118,6 +129,7 @@ final class UIOverlay {
             pixelFormat: .bgra8Unorm, width: Self.texW, height: Self.texH, mipmapped: false)
         desc.usage = [.shaderRead]
         texture = device.makeTexture(descriptor: desc)!
+        metaCache.onUpdate = { [weak self] in self?.redrawSoon() }
         buildControlButtons()
     }
 
@@ -150,12 +162,63 @@ final class UIOverlay {
             Button(rect: rect(3, 1), label: { "Рецентр" }, action: .ui(.recenter)),
             Button(rect: rect(0, 2), label: { "Файл…" }, action: .showPicker),
             Button(rect: rect(1, 2, span: 2), label: { [weak self] in
-                "Проекция: " + (self?.renderer?.config.projection.shortLabel ?? "")
-            }, action: .ui(.cycleProjection)),
+                guard let cfg = self?.renderer?.config else { return "Формат…" }
+                return "Формат: \(cfg.projection.shortLabel) · \(cfg.stereo.shortLabel)"
+            }, action: .showFormat),
             Button(rect: rect(3, 2), label: { [weak self] in
-                self?.renderer?.config.stereo.shortLabel ?? ""
-            }, action: .ui(.cycleStereo)),
+                String(format: "%g×", self?.renderer?.playbackRate ?? 1)
+            }, action: .cycleSpeed),
         ]
+    }
+
+    // MARK: - Кнопки: подменю «Формат»
+
+    private static let speeds: [Float] = [0.5, 1.0, 1.25, 1.5, 2.0]
+
+    private func buildFormatButtons() {
+        buttons.removeAll()
+        formatLabels.removeAll()
+        let x0 = 24.0, labelW = 230.0, rowH = 64.0, gap = 16.0
+        let optX = x0 + labelW + 16.0
+        let optW = Double(Self.texW) - 24.0 - optX
+
+        func rowRect(_ i: Int) -> Double { // CG y нижнего края ряда i (сверху)
+            Double(Self.texH) - 80.0 - Double(i) * (rowH + gap) - rowH
+        }
+        func addRow(_ i: Int, label: @escaping () -> String,
+                    options: [(String, ButtonAction, Bool)]) {
+            let y = rowRect(i)
+            formatLabels.append((label, CGRect(x: x0, y: y, width: labelW, height: rowH)))
+            let g = 12.0
+            let w = (optW - Double(options.count - 1) * g) / Double(options.count)
+            for (j, opt) in options.enumerated() {
+                buttons.append(Button(
+                    rect: CGRect(x: optX + Double(j) * (w + g), y: y, width: w, height: rowH),
+                    label: { opt.0 }, action: opt.1, highlighted: opt.2))
+            }
+        }
+
+        let cfg = renderer?.config
+        addRow(0, label: { "Проекция" }, options: Projection.allCases.map {
+            ($0.shortLabel, .setProjection($0), cfg?.projection == $0)
+        })
+        addRow(1, label: { "Стерео" }, options: StereoLayout.allCases.map {
+            ($0.shortLabel, .setStereo($0), cfg?.stereo == $0)
+        })
+        addRow(2, label: { "Скорость" }, options: Self.speeds.map {
+            (String(format: "%g×", $0), .setSpeed($0), renderer?.playbackRate == $0)
+        })
+        addRow(3, label: { [weak self] in
+            "Fisheye \(Int(self?.renderer?.config.fisheyeFovDeg ?? 0))°"
+        }, options: [
+            ("−", .fovDown, false),
+            ("+", .fovUp, false),
+            (cfg?.flipV ?? 1 < 0 ? "Флип: вкл" : "Флип: выкл", .toggleFlip, cfg?.flipV ?? 1 < 0),
+        ])
+
+        buttons.append(Button(
+            rect: CGRect(x: (Double(Self.texW) - 300) / 2, y: 14, width: 300, height: 56),
+            label: { "Готово" }, action: .formatDone))
     }
 
     // MARK: - Кнопки: режим выбора файла
@@ -201,6 +264,7 @@ final class UIOverlay {
         pickerDir = dir
         pickerScroll = 0
         pickerEntries = []
+        metaCache.cancelPending() // миниатюры покинутой папки больше не нужны
         loading = true
         loadStarted = CACurrentMediaTime()
         loadToken += 1
@@ -436,6 +500,11 @@ final class UIOverlay {
         guard active else { return }
         active = false
         releasedForDialog = false
+        // Подменю формата не переживает скрытие панели
+        if mode == .format {
+            mode = .controls
+            buildControlButtons()
+        }
         releaseMouse()
     }
 
@@ -476,6 +545,8 @@ final class UIOverlay {
                 scrollMemory[pickerDir.path] = pickerScroll
                 mode = .controls
                 buildControlButtons()
+                // Не конкурировать с декодером открываемого видео
+                metaCache.cancelPending()
                 onOpenFile?(entry.url)
             }
             redrawSoon()
@@ -490,10 +561,49 @@ final class UIOverlay {
             if renderer?.video != nil {
                 mode = .controls
                 buildControlButtons()
+                metaCache.cancelPending()
                 redrawSoon()
             }
         case .showPicker:
             openPicker()
+        case .showFormat:
+            mode = .format
+            buildFormatButtons()
+            redrawSoon()
+        case .formatDone:
+            mode = .controls
+            buildControlButtons()
+            redrawSoon()
+        case .setProjection(let p):
+            renderer?.config.projection = p
+            print("[player] проекция: \(p.label)")
+            buildFormatButtons()
+            redrawSoon()
+        case .setStereo(let s):
+            renderer?.config.stereo = s
+            print("[player] стерео: \(s.label)")
+            buildFormatButtons()
+            redrawSoon()
+        case .setSpeed(let v):
+            renderer?.setPlaybackRate(v)
+            buildFormatButtons()
+            redrawSoon()
+        case .toggleFlip:
+            renderer?.config.flipV *= -1
+            print("[player] вертикальный флип: \((renderer?.config.flipV ?? 1) < 0 ? "вкл" : "выкл")")
+            buildFormatButtons()
+            redrawSoon()
+        case .fovDown:
+            renderer?.config.fisheyeFovDeg -= 5
+            redrawSoon()
+        case .fovUp:
+            renderer?.config.fisheyeFovDeg += 5
+            redrawSoon()
+        case .cycleSpeed:
+            let cur = renderer?.playbackRate ?? 1
+            let idx = Self.speeds.firstIndex(of: cur) ?? 1
+            renderer?.setPlaybackRate(Self.speeds[(idx + 1) % Self.speeds.count])
+            redrawSoon()
         case .timeline:
             guard durationSeconds() != nil else { return nil }
             scrubbing = true
@@ -593,9 +703,21 @@ final class UIOverlay {
                 ctx.setFillColor(CGColor(red: 0.20, green: 0.22, blue: 0.27, alpha: 0.95))
             }
             ctx.fillPath()
-            let fontSize: CGFloat = mode == .picker ? 26 : 34
+            if case .pickerEntry(let idx) = b.action, !pickerEntries[idx].isDir {
+                drawVideoRow(ctx, rect: b.rect, entry: pickerEntries[idx])
+                continue
+            }
+            let fontSize: CGFloat = mode == .picker ? 26 : (mode == .format ? 28 : 34)
             drawText(b.label(), in: b.rect, size: fontSize, color: .white,
                      centered: mode != .picker || !isEntryButton(b))
+        }
+
+        // Подписи рядов подменю «Формат»
+        if mode == .format {
+            for label in formatLabels {
+                drawText(label.text(), in: label.rect, size: 28,
+                         color: NSColor(white: 0.8, alpha: 1), centered: false)
+            }
         }
 
         // Заголовок сверху
@@ -613,6 +735,9 @@ final class UIOverlay {
             let shown = path.count > 52 ? "…" + path.suffix(51) : path
             drawText(loading ? "Чтение… " + shown : shown,
                      in: topRect, size: 26, color: NSColor(white: 0.75, alpha: 1))
+        case .format:
+            drawText("Формат воспроизведения", in: topRect, size: 30,
+                     color: NSColor(white: 0.92, alpha: 1))
         }
 
         drawOSDIfNeeded(ctx)
@@ -658,6 +783,56 @@ final class UIOverlay {
             ctx.setFillColor(CGColor(red: 0.05, green: 0.06, blue: 0.08, alpha: 0.95))
             ctx.fillPath()
             drawText(text, in: plate, size: 24, color: .white)
+        }
+    }
+
+    // Строка видеофайла в списке: миниатюра, имя, длительность и разрешение,
+    // полоска прогресса «где остановились» поверх миниатюры
+    private func drawVideoRow(_ ctx: CGContext, rect: CGRect, entry: PickerEntry) {
+        metaCache.request(entry.url)
+        let meta = metaCache.meta(for: entry.url)
+
+        let thumbRect = CGRect(x: rect.minX + 5, y: rect.minY + 4,
+                               width: 82, height: rect.height - 8)
+        ctx.saveGState()
+        ctx.addPath(CGPath(roundedRect: thumbRect, cornerWidth: 6, cornerHeight: 6, transform: nil))
+        ctx.clip()
+        if let thumb = meta?.thumb {
+            ctx.draw(thumb, in: thumbRect)
+        } else {
+            ctx.setFillColor(CGColor(gray: 0.12, alpha: 1))
+            ctx.fill(thumbRect)
+            drawText("🎬", in: thumbRect, size: 22, color: .white)
+        }
+        if let pos = ResumeStore.position(for: entry.url),
+           let d = meta?.durationS, d > 0 {
+            let frac = max(0, min(1, pos / d))
+            ctx.setFillColor(CGColor(red: 0.36, green: 0.42, blue: 0.95, alpha: 1))
+            ctx.fill(CGRect(x: thumbRect.minX, y: thumbRect.minY,
+                            width: thumbRect.width * frac, height: 4))
+        }
+        ctx.restoreGState()
+
+        let textX = rect.minX + 100
+        let isCurrent = entry.url.path == currentFile?.path
+        let name = (isCurrent ? "▶ " : "") + String(entry.name.prefix(52))
+        drawText(name,
+                 in: CGRect(x: textX, y: rect.midY - 2,
+                            width: rect.maxX - 8 - textX, height: rect.height / 2 - 2),
+                 size: 23, color: .white, centered: false)
+
+        var info: [String] = []
+        if let d = meta?.durationS, d.isFinite, d > 0 {
+            info.append(timeString(CMTime(seconds: d, preferredTimescale: 600)))
+        }
+        if let dims = meta?.dims, dims.width > 0 {
+            info.append("\(Int(dims.width))×\(Int(dims.height))")
+        }
+        if !info.isEmpty {
+            drawText(info.joined(separator: " · "),
+                     in: CGRect(x: textX, y: rect.minY + 2,
+                                width: rect.maxX - 8 - textX, height: rect.height / 2 - 4),
+                     size: 18, color: NSColor(white: 0.62, alpha: 1), centered: false)
         }
     }
 

@@ -45,6 +45,7 @@ struct Uniforms {
     float4 p2;       // x: хроматика, y: панель UI видима, zw: курсор (uv текстуры панели)
     float4 p3;       // панель в tan-пространстве: центр (xy), полуразмеры (zw)
     float4 p4;       // x: есть видео, y: полный диапазон YUV, z: BT.2020, w: кадр BGRA
+    float4 p5;       // x: passthrough вкл, y: FOV камер (рад), z: яркость
 };
 
 constant float FX = 0.3585564;
@@ -112,7 +113,9 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         device const packed_float3 *lut [[buffer(1)]],
                         texture2d<float> videoY [[texture(0)]],
                         texture2d<float> ui [[texture(1)]],
-                        texture2d<float> videoCbCr [[texture(2)]]) {
+                        texture2d<float> videoCbCr [[texture(2)]],
+                        texture2d<float> camL [[texture(3)]],
+                        texture2d<float> camR [[texture(4)]]) {
     constexpr sampler smp(mag_filter::linear, min_filter::linear, address::clamp_to_edge);
 
     bool hasVideo = uni.p4.x > 0.5;
@@ -202,6 +205,33 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             rgb[ch] = sampled[ch];
         } else {
             rgb = sampled;
+        }
+    }
+
+    // Passthrough: вид с передних камер шлема. Камеры жёстко связаны с
+    // корпусом, поэтому поза головы не применяется — картинка стоит в поле
+    // зрения. Модель объектива — равноудалённая (fisheye), FOV настраивается.
+    if (uni.p5.x > 0.5) {
+        float aG = local_x * scale[1];
+        float bG = (local_y - 0.0002302693) * scale[1];
+        float ptx = k3 * aG - k4 * bG;
+        float ptyDown = k4 * aG + k3 * bG;
+
+        float3 dir = normalize(float3(ptx, -ptyDown, -1.0));
+        float theta = acos(clamp(-dir.z, -1.0, 1.0));
+        float r = theta / uni.p5.y;
+        if (r <= 0.5) {
+            float2 xy = dir.xy;
+            float len = length(xy);
+            float2 d = len > 1e-6 ? xy / len : float2(0.0);
+            // Кадр 1016x1016 лежит в текстуре шириной 1024
+            float u = (0.5 + r * d.x) * (1016.0 / 1024.0);
+            float v = 0.5 - r * d.y;
+            float g = eye == 0 ? camL.sample(smp, float2(u, v)).r
+                               : camR.sample(smp, float2(u, v)).r;
+            rgb = float3(saturate(g * uni.p5.z));
+        } else {
+            rgb = float3(0.0);
         }
     }
 
@@ -457,6 +487,7 @@ struct Uniforms {
     var p2: SIMD4<Float> // хроматика, панель видима, курсор uv
     var p3: SIMD4<Float> // панель: центр и полуразмеры в tan-пространстве
     var p4: SIMD4<Float> // есть видео, полный диапазон YUV, BT.2020
+    var p5: SIMD4<Float> // passthrough вкл, FOV камер (рад), яркость
 }
 
 // MARK: - Видео
@@ -857,6 +888,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     var overlay: UIOverlay!
     // Скорость воспроизведения; при открытии нового файла сбрасывается на 1×
     var playbackRate: Float = 1.0
+    // Вид с камер шлема (двойное нажатие Fn или клавиша B)
+    var passthrough: PassthroughSource?
+    private var pausedByPassthrough = false
     // Панель UI в tan-пространстве: центр и полуразмеры (аспект 2:1 как текстура)
     let panelCenter = SIMD2<Float>(0, -0.05)
     let panelHalf = SIMD2<Float>(0.5, 0.25)
@@ -909,6 +943,8 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastButton = false
     private var buttonDownTime = 0.0
     private var buttonLongFired = false
+    private var pendingSingleClick = false
+    private var lastClickTime = 0.0
     // Автопауза по датчику приближения (шлем снят/надет), с дебаунсом
     private var wornState = true
     private var lastProxRaw = true
@@ -924,6 +960,32 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         overlay?.showOSD(String(format: "Скорость %g×", v))
         print(String(format: "[player] скорость: %g×", v))
+    }
+
+    // Вид с камер: видео паузим, чтобы не пропустить кусок
+    func togglePassthrough() {
+        guard let pt = passthrough, pt.available else {
+            overlay?.showOSD("Камеры недоступны")
+            return
+        }
+        if pt.active {
+            pt.stop()
+            if pausedByPassthrough {
+                pausedByPassthrough = false
+                video?.player.rate = playbackRate
+            }
+            overlay?.showOSD("К видео")
+            return
+        }
+        guard pt.start() else {
+            overlay?.showOSD("Камеры не запустились (см. лог)")
+            return
+        }
+        if let p = video?.player, p.rate != 0 {
+            p.pause()
+            pausedByPassthrough = true
+        }
+        overlay?.showOSD("Вид с камер — двойное нажатие Fn или B, чтобы вернуться", duration: 3)
     }
 
     // Закрепить панель перед текущим взглядом (горизонт сохраняем)
@@ -965,8 +1027,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        // Кнопка Fn на шлеме: короткое нажатие — рецентр (горизонт сохраняется),
-        // долгое (>0.8 с) — центр видео точно по направлению взгляда
+        // Кнопка Fn на шлеме: одиночное нажатие — рецентр (горизонт
+        // сохраняется), двойное — вид с камер и обратно, долгое (>0.8 с) —
+        // центр видео точно по направлению взгляда
         let button = psvr2_get_button() == 1
         let nowBtn = CACurrentMediaTime()
         if button && !lastButton {
@@ -975,11 +1038,24 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         if button && !buttonLongFired && nowBtn - buttonDownTime > 0.8 {
             buttonLongFired = true
+            pendingSingleClick = false
             tracker.requestFullRecenter()
             overlay?.showOSD("Центр — по направлению взгляда")
             print("[player] полный рецентр (долгое нажатие кнопки шлема)")
         }
         if !button && lastButton && !buttonLongFired {
+            if pendingSingleClick && nowBtn - lastClickTime < 0.45 {
+                pendingSingleClick = false // второй клик — двойное нажатие
+                togglePassthrough()
+                print("[player] вид с камер (двойное нажатие кнопки шлема)")
+            } else {
+                pendingSingleClick = true
+                lastClickTime = nowBtn
+            }
+        }
+        // Одиночное нажатие срабатывает, когда пары уже не будет
+        if pendingSingleClick && nowBtn - lastClickTime > 0.45 {
+            pendingSingleClick = false
             tracker.requestRecenter()
             print("[player] рецентр (кнопка шлема)")
         }
@@ -989,6 +1065,7 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         overlay?.tick()
         video?.updateTexture()
+        passthrough?.update()
 
         guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
@@ -1035,7 +1112,12 @@ final class Renderer: NSObject, MTKViewDelegate {
                 video?.textureY != nil ? 1 : 0,
                 (video?.fullRange ?? false) ? 1 : 0,
                 (video?.bt2020 ?? false) ? 1 : 0,
-                (video?.isBGRA ?? false) ? 1 : 0))
+                (video?.isBGRA ?? false) ? 1 : 0),
+            p5: SIMD4(
+                (passthrough?.gotFrame ?? false) ? 1 : 0,
+                (passthrough?.fovDeg ?? 150) * .pi / 180,
+                passthrough?.brightness ?? 1.6,
+                0))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -1043,6 +1125,8 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentTexture(video?.textureY ?? placeholderY, index: 0)
         enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
         enc.setFragmentTexture(video?.textureCbCr ?? placeholderCbCr, index: 2)
+        enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
+        enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cmd.present(drawable)
@@ -1111,6 +1195,8 @@ final class PlayerView: MTKView {
         case 9: // V
             r.config.flipV *= -1
             print("[player] вертикальный флип: \(r.config.flipV < 0 ? "вкл" : "выкл")")
+        case 11: // B — вид с камер шлема
+            r.togglePassthrough()
         case 123: // ←
             seek(by: -15)
         case 124: // →
@@ -1150,6 +1236,13 @@ final class PlayerView: MTKView {
 
     private func changeFov(by delta: Float) {
         guard let r = renderer else { return }
+        // В режиме камер +/- подгоняют угол объектива под ощущение масштаба
+        if let pt = r.passthrough, pt.active {
+            pt.fovDeg = max(60, min(220, pt.fovDeg + delta))
+            r.overlay?.showOSD("FOV камер: \(Int(pt.fovDeg))°")
+            print("[passthrough] FOV камер: \(Int(pt.fovDeg))°")
+            return
+        }
         r.config.fisheyeFovDeg += delta
         if r.config.projection == .fisheye {
             print("[player] fisheye FOV: \(r.config.fisheyeFovDeg)°")
@@ -1329,6 +1422,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         renderer = try! Renderer(device: device, config: config, calibration: calibration)
+
+        renderer.passthrough = PassthroughSource(device: device)
 
         // Панель управления в шлеме (появляется при движении мыши)
         let overlay = UIOverlay(device: device)

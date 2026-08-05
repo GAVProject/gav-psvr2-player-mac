@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -19,6 +20,10 @@
 #define SLAM_ENDPOINT 0x83
 #define STATUS_INTERFACE 7
 #define STATUS_ENDPOINT 0x88
+#define CAMERA_INTERFACE 6
+#define CAMERA_ENDPOINT 0x87
+/* Заголовок кадра камер ('V','I'), дальше две BC4-плоскости */
+#define CAMERA_HEADER_BYTES 256
 
 #define GYRO_SCALE (2000.0f / 32767.0f)
 #define DEG_TO_RAD(d) ((d) * (float)M_PI / 180.0f)
@@ -77,6 +82,13 @@ static double g_imu_time;
 static int g_proximity;
 static int g_function_button;
 static int g_ipd_mm = 63;
+
+/* Камеры: двойная буферизация кадра под общим мьютексом */
+static pthread_t g_camera_thread;
+static volatile int g_camera_running;
+static unsigned char *g_camera_frame; /* две BC4-плоскости подряд */
+static int g_camera_seq;              /* растёт с каждым принятым кадром */
+static int g_camera_seq_taken;
 
 /* Кольцевой буфер IMU: ~130 мс истории при 2000 Гц */
 #define IMU_RING_SIZE 256
@@ -446,4 +458,119 @@ int psvr2_get_button(void)
 	int b = g_function_button;
 	pthread_mutex_unlock(&g_lock);
 	return b;
+}
+
+/* --- Камеры шлема (passthrough) ---
+ * Протокол из PSVR2Toolkit (https://github.com/BnuuySolutions/PSVR2Toolkit):
+ * камеры включаются vendor-командой 0x0B, кадры идут пакетами 'V','I'
+ * (заголовок 256 байт + две BC4-плоскости). Команда «не прилипает»:
+ * шлём её после захвата интерфейса и повторяем при простое потока.
+ */
+
+static int camera_power(int on)
+{
+	uint8_t data[8] = {1, 0, 0, 0, (uint8_t)(on ? 0x10 : 0x05), 0, 0, 0};
+	return send_control(0x0B, 1, data, sizeof(data));
+}
+
+static void *camera_thread_fn(void *arg)
+{
+	(void)arg;
+	const int frame_bytes = CAMERA_HEADER_BYTES + 2 * PSVR2_CAM_PLANE_BYTES;
+	unsigned char *buf = malloc(frame_bytes + 4096);
+	if (buf == NULL) {
+		return NULL;
+	}
+
+	while (g_camera_running) {
+		int transferred = 0;
+		int ret = libusb_bulk_transfer(g_dev, CAMERA_ENDPOINT, buf,
+		                               frame_bytes + 4096, &transferred, 300);
+		if (ret == LIBUSB_ERROR_TIMEOUT) {
+			camera_power(1); /* поток мог заглохнуть — переспрашиваем */
+			continue;
+		}
+		if (ret != 0) {
+			break;
+		}
+		if (transferred < frame_bytes || buf[0] != 'V' || buf[1] != 'I') {
+			continue;
+		}
+
+		pthread_mutex_lock(&g_lock);
+		if (g_camera_frame != NULL) {
+			memcpy(g_camera_frame, buf + CAMERA_HEADER_BYTES, 2 * PSVR2_CAM_PLANE_BYTES);
+			g_camera_seq++;
+		}
+		pthread_mutex_unlock(&g_lock);
+	}
+
+	free(buf);
+	return NULL;
+}
+
+int psvr2_camera_start(void)
+{
+	if (g_dev == NULL) {
+		return -1;
+	}
+	if (g_camera_running) {
+		return 0;
+	}
+
+	int ret = libusb_claim_interface(g_dev, CAMERA_INTERFACE);
+	if (ret != 0) {
+		fprintf(stderr, "psvr2: интерфейс камер занят: %s\n", libusb_error_name(ret));
+		return -1;
+	}
+
+	pthread_mutex_lock(&g_lock);
+	if (g_camera_frame == NULL) {
+		g_camera_frame = malloc(2 * PSVR2_CAM_PLANE_BYTES);
+	}
+	g_camera_seq = 0;
+	g_camera_seq_taken = 0;
+	pthread_mutex_unlock(&g_lock);
+
+	if (g_camera_frame == NULL) {
+		libusb_release_interface(g_dev, CAMERA_INTERFACE);
+		return -1;
+	}
+
+	/* Команда включения обязана идти после захвата интерфейса */
+	camera_power(1);
+
+	g_camera_running = 1;
+	if (pthread_create(&g_camera_thread, NULL, camera_thread_fn, NULL) != 0) {
+		g_camera_running = 0;
+		camera_power(0);
+		libusb_release_interface(g_dev, CAMERA_INTERFACE);
+		return -1;
+	}
+	return 0;
+}
+
+void psvr2_camera_stop(void)
+{
+	if (!g_camera_running) {
+		return;
+	}
+	g_camera_running = 0;
+	pthread_join(g_camera_thread, NULL);
+	camera_power(0);
+	libusb_release_interface(g_dev, CAMERA_INTERFACE);
+}
+
+int psvr2_camera_get_frame(unsigned char *left, unsigned char *right)
+{
+	int fresh = 0;
+	pthread_mutex_lock(&g_lock);
+	if (g_camera_frame != NULL && g_camera_seq != g_camera_seq_taken) {
+		g_camera_seq_taken = g_camera_seq;
+		memcpy(left, g_camera_frame, PSVR2_CAM_PLANE_BYTES);
+		memcpy(right, g_camera_frame + PSVR2_CAM_PLANE_BYTES, PSVR2_CAM_PLANE_BYTES);
+		fresh = 1;
+	}
+	pthread_mutex_unlock(&g_lock);
+	return fresh;
 }

@@ -44,6 +44,25 @@ int psvr2_get_distortion_calibration(float out[8]);
 /* Указатель на LUT 1024x3 float (r,g,b). */
 const float *psvr2_distortion_lut(void);
 
+/* --- Камеры шлема (passthrough) ---
+ * Кадры приходят парой BC4-текстур 1024x1016 (левая и правая камеры),
+ * 60 Гц. Протокол из PSVR2Toolkit: включение vendor-командой 0x0B,
+ * поток на интерфейсе 6, EP 0x87, сигнатура пакета 'V','I'. */
+
+#define PSVR2_CAM_WIDTH 1024
+#define PSVR2_CAM_HEIGHT 1016
+/* BC4: 4 бита на пиксель */
+#define PSVR2_CAM_PLANE_BYTES (PSVR2_CAM_WIDTH * PSVR2_CAM_HEIGHT / 2)
+
+/* Включает камеры и запускает поток чтения. 0 — успех. */
+int psvr2_camera_start(void);
+
+void psvr2_camera_stop(void);
+
+/* Копирует последний кадр: left и right — буферы по PSVR2_CAM_PLANE_BYTES.
+ * Возвращает 1, если кадр новый (с прошлого вызова), иначе 0. */
+int psvr2_camera_get_frame(unsigned char *left, unsigned char *right);
+
 #ifdef __cplusplus
 }
 #endif

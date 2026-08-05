@@ -37,6 +37,7 @@ vertex VSOut vs_main(uint vid [[vertex_id]]) {
 
 struct Uniforms {
     float4x4 rot;
+    float4x4 panelInv; // мир -> система панели (якорь взгляда в момент показа)
     float4 calibL;   // k1,k2,k3,k4 левого глаза
     float4 calibR;
     float4 p0;       // mode, stereo, fisheyeFovRad, flipV
@@ -204,33 +205,39 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         }
     }
 
-    // Панель управления: висит перед глазами (~1.5 м, лёгкий параллакс),
-    // координаты по зелёному каналу без флипа видео
+    // Панель управления: закреплена в пространстве по направлению взгляда
+    // в момент показа (~1.5 м, лёгкий параллакс). Направление луча переводим
+    // текущей позой в мир, затем в систему панели; координаты по зелёному
+    // каналу без флипа видео
     if (uni.p2.y > 0.5) {
         float aG = local_x * scale[1];
         float bG = (local_y - 0.0002302693) * scale[1];
         float panelTanX = k3 * aG - k4 * bG;
         float panelTanUp = -(k4 * aG + k3 * bG);
 
-        float disp = eye == 0 ? 0.021 : -0.021;
-        float2 pc = uni.p3.xy;
-        float2 ph = uni.p3.zw;
-        float pu = (panelTanX - disp - pc.x) / (2.0 * ph.x) + 0.5;
-        float pv = (panelTanUp - pc.y) / (2.0 * ph.y) + 0.5;
-        if (pu >= 0.0 && pu <= 1.0 && pv >= 0.0 && pv <= 1.0) {
-            float2 tuv = float2(pu, 1.0 - pv);
-            float4 uiC = ui.sample(smp, tuv);
+        float3 wDir = (uni.rot * float4(panelTanX, panelTanUp, -1.0, 0.0)).xyz;
+        float3 pDir = (uni.panelInv * float4(wDir, 0.0)).xyz;
+        if (pDir.z < -1e-3) {
+            float disp = eye == 0 ? 0.021 : -0.021;
+            float2 pc = uni.p3.xy;
+            float2 ph = uni.p3.zw;
+            float pu = (pDir.x / -pDir.z - disp - pc.x) / (2.0 * ph.x) + 0.5;
+            float pv = (pDir.y / -pDir.z - pc.y) / (2.0 * ph.y) + 0.5;
+            if (pu >= 0.0 && pu <= 1.0 && pv >= 0.0 && pv <= 1.0) {
+                float2 tuv = float2(pu, 1.0 - pv);
+                float4 uiC = ui.sample(smp, tuv);
 
-            // Виртуальный курсор: белая точка с тёмной обводкой
-            float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // аспект панели 2:1
-            float dcur = length(dvec);
-            if (dcur < 0.014) {
-                uiC = float4(1.0, 1.0, 1.0, 1.0);
-            } else if (dcur < 0.020) {
-                uiC = float4(0.0, 0.0, 0.0, 1.0);
+                // Виртуальный курсор: белая точка с тёмной обводкой
+                float2 dvec = (tuv - uni.p2.zw) * float2(2.0, 1.0); // аспект панели 2:1
+                float dcur = length(dvec);
+                if (dcur < 0.014) {
+                    uiC = float4(1.0, 1.0, 1.0, 1.0);
+                } else if (dcur < 0.020) {
+                    uiC = float4(0.0, 0.0, 0.0, 1.0);
+                }
+
+                rgb = rgb * (1.0 - uiC.a) + uiC.rgb; // premultiplied alpha
             }
-
-            rgb = rgb * (1.0 - uiC.a) + uiC.rgb; // premultiplied alpha
         }
     }
 
@@ -396,9 +403,13 @@ final class HeadTracker {
     // построчной коррекции развёртки в шейдере
     private(set) var worldAngularVelocity = SIMD3<Float>(repeating: 0)
 
+    // Последняя поза вида — для якоря панели UI
+    private(set) var viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+
     func viewRotation() -> float4x4 {
         guard let q = currentOrientation() else {
             connected = false
+            viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
             return matrix_identity_float4x4
         }
         connected = true
@@ -414,6 +425,7 @@ final class HeadTracker {
         smoothManual()
         lastBase = recenter * q
         let view = offsetCurrent * lastBase
+        viewQuat = view
 
         var gyro = [Float](repeating: 0, count: 3)
         var age: Double = 0
@@ -432,6 +444,7 @@ final class HeadTracker {
 
 struct Uniforms {
     var rot: float4x4
+    var panelInv: float4x4 // мир -> система панели (якорь в момент показа)
     var calibL: SIMD4<Float>
     var calibR: SIMD4<Float>
     var p0: SIMD4<Float>
@@ -810,6 +823,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Панель UI в tan-пространстве: центр и полуразмеры (аспект 2:1 как текстура)
     let panelCenter = SIMD2<Float>(0, -0.05)
     let panelHalf = SIMD2<Float>(0.5, 0.25)
+    // Якорь панели в мире: направление взгляда (yaw+pitch, без крена)
+    // в момент показа
+    private var panelAnchor = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     // Развёртка панели: 2040/2200 строки кадра при 120 Гц (из драйвера Monado)
     let scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
 
@@ -862,6 +878,15 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
+    // Закрепить панель перед текущим взглядом (горизонт сохраняем)
+    func anchorPanel() {
+        let f = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
+        let yaw = atan2(-f.x, -f.z)
+        let pitch = asin(max(-1, min(1, f.y)))
+        panelAnchor = simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0))
+            * simd_quatf(angle: pitch, axis: SIMD3<Float>(1, 0, 0))
+    }
+
     private func updateProximity() {
         var prox: Int32 = 0
         var ipd: Int32 = 0
@@ -912,8 +937,24 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         let rot = tracker.viewRotation()
         let gyroW = scanlineEnabled ? tracker.worldAngularVelocity : .zero
+
+        // Панель закреплена в мире; одиночная плашка OSD — приклеена к взгляду
+        // (panelInv * rot = I). Если панель ушла из виду дальше ~70° —
+        // переносим её к текущему взгляду
+        let panelInv: float4x4
+        if overlay?.active == true {
+            let gaze = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
+            if simd_dot(gaze, panelAnchor.act(SIMD3<Float>(0, 0, -1))) < 0.35 {
+                anchorPanel()
+            }
+            panelInv = float4x4(panelAnchor.inverse)
+        } else {
+            panelInv = rot.transpose
+        }
+
         var uni = Uniforms(
             rot: rot,
+            panelInv: panelInv,
             calibL: SIMD4(calibration[0], calibration[1], calibration[4], calibration[5]),
             calibR: SIMD4(calibration[2], calibration[3], calibration[6], calibration[7]),
             p0: SIMD4(
@@ -972,6 +1013,8 @@ final class PlayerView: MTKView {
     var renderer: Renderer?
 
     override var acceptsFirstResponder: Bool { true }
+    // Клики по неключевому окну шлема (ключевое окно — пульт на мониторе)
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func keyDown(with event: NSEvent) {
         guard let r = renderer else { return }
@@ -1117,6 +1160,14 @@ final class PlayerView: MTKView {
         }
     }
 
+    override func mouseUp(with event: NSEvent) {
+        guard let overlay = renderer?.overlay else { return }
+        if let action = overlay.mouseUp() {
+            perform(uiAction: action)
+            overlay.redrawSoon()
+        }
+    }
+
     func perform(uiAction: UIAction) {
         guard let r = renderer else { return }
         switch uiAction {
@@ -1132,14 +1183,14 @@ final class PlayerView: MTKView {
             print("[player] рецентр")
         case .cycleProjection: cycleProjection()
         case .cycleStereo: cycleStereo()
+        case .seekFraction(let f):
+            guard let p = r.video?.player, let item = p.currentItem,
+                  item.duration.isNumeric else { break }
+            let target = CMTime(seconds: item.duration.seconds * f, preferredTimescale: 600)
+            p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+            print("[player] перемотка на \(Int(item.duration.seconds * f)) с")
         }
     }
-}
-
-// Безрамочное окно по умолчанию не принимает клавиатуру — разрешаем явно
-final class KeyableWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1149,6 +1200,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var cvLink: CVDisplayLink?
     var playerView: PlayerView?
     var accessHelperWindow: NSWindow?
+    // Окно-пульт на обычном мониторе: держит клавиатурный фокус, чтобы
+    // системные диалоги открывались на видимом экране, а не в шлеме
+    var controlWindow: NSWindow?
+    var sweeper: WindowSweeper?
     let videoURL: URL?
 
     init(videoURL: URL?) {
@@ -1223,21 +1278,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         playerView = view
 
         if vrScreen != nil {
-            window = KeyableWindow(
+            // Безрамочное окно шлема намеренно НЕ становится ключевым:
+            // клавиатурный фокус живёт в окне-пульте на мониторе, поэтому
+            // системные диалоги открываются там, где их видно
+            window = NSWindow(
                 contentRect: screen.frame, styleMask: [.borderless],
                 backing: .buffered, defer: false, screen: screen)
             window.level = .mainMenu + 1
             window.setFrame(screen.frame, display: true)
+            window.contentView = view
+            window.orderFrontRegardless()
+            makeControlWindow()
         } else {
             let rect = NSRect(x: 100, y: 100, width: 1000, height: 510)
             window = NSWindow(
                 contentRect: rect, styleMask: [.titled, .closable, .resizable],
                 backing: .buffered, defer: false)
             window.title = "PSVR2 Player (предпросмотр)"
+            window.contentView = view
+            window.makeKeyAndOrderFront(nil)
+            window.makeFirstResponder(view)
         }
-        window.contentView = view
-        window.makeKeyAndOrderFront(nil)
-        window.makeFirstResponder(view)
         NSApp.activate(ignoringOtherApps: true)
 
         // Подстраховка: ловим клавиши на уровне приложения, даже если окно
@@ -1258,6 +1319,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             print("[display] Частота дисплея шлема по CoreGraphics: \(mode.refreshRate) Гц, "
                 + "maxFPS экрана: \(screen.maximumFramesPerSecond)")
+        }
+        if vrScreen != nil {
+            startWindowSweeper(vrScreen: screen)
         }
 
         var linkOut: CVDisplayLink?
@@ -1284,6 +1348,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         print("[player] Управление: Space пауза · R или кнопка Fn шлема — рецентр · F проекция · G стерео · V флип")
         print("[player]             ←/→ ±15с · ↑/↓ громкость · +/- FOV fisheye · Q выход")
         print("[player]             отладка: P предсказание · [/] упреждение · S развёртка · C хроматика")
+    }
+
+    // Окно-пульт на обычном мониторе. Держит клавиатурный фокус приложения,
+    // чтобы системные диалоги открывались на видимом экране, а не в шлеме
+    private func makeControlWindow() {
+        let deskScreen = NSScreen.screens.first {
+            !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
+        } ?? NSScreen.main!
+        let size = NSSize(width: 480, height: 150)
+        let frame = NSRect(
+            x: deskScreen.visibleFrame.maxX - size.width - 24,
+            y: deskScreen.visibleFrame.minY + 24,
+            width: size.width, height: size.height)
+
+        let win = NSWindow(
+            contentRect: frame, styleMask: [.titled, .miniaturizable],
+            backing: .buffered, defer: false, screen: deskScreen)
+        win.title = "PSVR2 Player — пульт"
+        win.isReleasedWhenClosed = false
+
+        let label = NSTextField(wrappingLabelWithString:
+            "Плеер выводит в шлем; системные диалоги открываются здесь.\n"
+            + "Space пауза · ←/→ перемотка · ↑/↓ громкость · Q выход")
+        label.frame = NSRect(x: 16, y: 66, width: size.width - 32, height: size.height - 82)
+        label.font = .systemFont(ofSize: 12)
+        win.contentView?.addSubview(label)
+
+        let openBtn = NSButton(title: "Открыть видео…", target: self,
+                               action: #selector(openVideoFromMonitor))
+        openBtn.bezelStyle = .rounded
+        openBtn.controlSize = .large
+        openBtn.font = .systemFont(ofSize: 15, weight: .semibold)
+        openBtn.frame = NSRect(x: 16, y: 14, width: 214, height: 44)
+        win.contentView?.addSubview(openBtn)
+
+        win.makeKeyAndOrderFront(nil)
+        controlWindow = win
+    }
+
+    // Выбор видео стандартным диалогом на мониторе
+    @objc private func openVideoFromMonitor() {
+        let panel = NSOpenPanel()
+        panel.allowedFileTypes = ["mp4", "m4v", "mov"]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.level = .floating // не ниже других окон захваченного стола
+        panel.begin { [weak self] resp in
+            guard resp == .OK, let url = panel.url else { return }
+            self?.loadVideo(url)
+        }
+    }
+
+    // Сторож: чужие окна, попавшие на дисплей шлема, переносим на монитор
+    private func startWindowSweeper(vrScreen: NSScreen) {
+        let deskScreen = NSScreen.screens.first { $0 != vrScreen } ?? vrScreen
+        guard deskScreen != vrScreen else { return }
+        // NSScreen (y вверх от низа главного экрана) -> CG (y вниз от верха)
+        let primaryHeight = NSScreen.screens[0].frame.height
+        func cgRect(_ f: NSRect) -> CGRect {
+            CGRect(x: f.minX, y: primaryHeight - f.maxY, width: f.width, height: f.height)
+        }
+        let sweeper = WindowSweeper(
+            vrFrame: cgRect(vrScreen.frame), targetFrame: cgRect(deskScreen.frame))
+        sweeper.onStray = { [weak self] name, moved in
+            if moved {
+                self?.renderer.overlay?.showOSD("Окно «\(name)» перенесено на монитор", duration: 4)
+                print("[sweeper] окно «\(name)» перенесено с экрана шлема на монитор")
+            } else {
+                self?.renderer.overlay?.showOSD(
+                    "Окно «\(name)» открылось на экране шлема (см. лог)", duration: 6)
+                print("[sweeper] Окно «\(name)» на экране шлема. Для автопереноса дайте доступ:")
+                print("[sweeper] Настройки → Конфиденциальность → Универсальный доступ → «+» → PSVR2Player.app")
+            }
+        }
+        sweeper.start()
+        self.sweeper = sweeper
     }
 
     // Системный запрос доступа macOS показывает на экране активного окна.
@@ -1344,9 +1484,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             accessHelperWindow = nil
         }
         window.level = .mainMenu + 1
-        window.makeKeyAndOrderFront(nil)
-        if let view = playerView {
-            window.makeFirstResponder(view)
+        window.orderFrontRegardless()
+        if let control = controlWindow {
+            control.makeKeyAndOrderFront(nil)
+        } else {
+            window.makeKeyAndOrderFront(nil)
+            if let view = playerView {
+                window.makeFirstResponder(view)
+            }
         }
     }
 
@@ -1385,6 +1530,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 setbuf(stdout, nil)
 setbuf(stderr, nil)
+
+// Запуск из Finder/Dock: терминала нет, лог пишем в файл.
+// Смотреть: tail -f ~/Library/Logs/PSVR2Player.log или приложение «Консоль»
+if isatty(STDOUT_FILENO) == 0 {
+    let logPath = ("~/Library/Logs/PSVR2Player.log" as NSString).expandingTildeInPath
+    freopen(logPath, "w", stdout)
+    freopen(logPath, "a", stderr)
+    setbuf(stdout, nil)
+    setbuf(stderr, nil)
+    print("[player] Запуск \(Date()); лог: \(logPath)")
+}
 
 let args = CommandLine.arguments
 // Без аргумента файл выбирается панелью в шлеме после запуска

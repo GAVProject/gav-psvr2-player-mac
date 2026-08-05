@@ -7,6 +7,9 @@
 //
 // Режим выбора файла: список папок и видеофайлов с прокруткой; открывается
 // автоматически при старте без аргумента или кнопкой «Файл…».
+//
+// Таймлайн: полоса прогресса с перемоткой кликом и перетаскиванием; при
+// наведении показывает время в точке курсора.
 
 import AppKit
 import AVFoundation
@@ -15,6 +18,7 @@ import Metal
 enum UIAction {
     case playPause, seekBack, seekFwd, seekBack30, seekFwd30,
          volDown, volUp, recenter, cycleProjection, cycleStereo
+    case seekFraction(Double) // перемотка в долю длительности (таймлайн)
 }
 
 final class UIOverlay {
@@ -26,8 +30,9 @@ final class UIOverlay {
     private enum ButtonAction {
         case ui(UIAction)
         case pickerEntry(Int)
-        case pickerUp, pickerDown, pickerCancel, pickerDrives, pickerAccess
+        case pickerUp, pickerDown, pickerCancel, pickerDrives
         case showPicker
+        case timeline
     }
 
     private struct Button {
@@ -86,6 +91,11 @@ final class UIOverlay {
     private var savedMousePos: CGPoint?
     private var lastHovered: Int = -1
 
+    // Перетаскивание ручки таймлайна: пока зажата ЛКМ, позиция курсора
+    // задаёт целевую долю; сам seek выполняется на отпускании
+    private var scrubbing = false
+    private var scrubFraction = 0.0
+
     // Всплывающий индикатор (например, громкость): показывается и без панели
     private var osdText: String?
     private var osdUntil = 0.0
@@ -114,17 +124,20 @@ final class UIOverlay {
     // MARK: - Кнопки: режим управления
 
     private func buildControlButtons() {
-        let colW = 232.0, rowH = 104.0, gap = 16.0
+        let colW = 232.0, rowH = 100.0, gap = 16.0
         let x0 = 24.0
         func rect(_ col: Int, _ row: Int, span: Int = 1) -> CGRect {
-            // row 0 — верхний ряд кнопок; в CG-координатах y растёт вверх
-            let y = Double(Self.texH) - 96.0 - Double(row + 1) * (rowH + gap) + gap
+            // row 0 — верхний ряд кнопок; ряды прижаты к низу панели,
+            // над ними таймлайн (в CG-координатах y растёт вверх)
+            let y = 20.0 + Double(2 - row) * (rowH + gap)
             return CGRect(
                 x: x0 + Double(col) * (colW + gap), y: y,
                 width: colW * Double(span) + gap * Double(span - 1), height: rowH)
         }
 
         buttons = [
+            Button(rect: CGRect(x: x0, y: 366, width: Double(Self.texW) - 2 * x0, height: 64),
+                   label: { "" }, action: .timeline),
             Button(rect: rect(0, 0), label: { "−30 с" }, action: .ui(.seekBack30)),
             Button(rect: rect(1, 0), label: { "−15 с" }, action: .ui(.seekBack)),
             Button(rect: rect(2, 0), label: { "+15 с" }, action: .ui(.seekFwd)),
@@ -273,13 +286,12 @@ final class UIOverlay {
                 highlighted: isCurrent))
         }
 
-        let bw = (w - 4 * gap) / 5
+        let bw = (w - 3 * gap) / 4
         let by = 10.0, bh = 56.0
         let bottom: [(String, ButtonAction)] = [
             ("▲", .pickerUp),
             ("▼", .pickerDown),
             ("💾 Диски", .pickerDrives),
-            ("🔓 Доступ", .pickerAccess),
             ("Отмена", .pickerCancel),
         ]
         for (i, item) in bottom.enumerated() {
@@ -348,8 +360,9 @@ final class UIOverlay {
             return
         }
 
-        // Пока зажата ПКМ или открыт выбор файла — автоскрытие не тикает
-        if rightHeld || mode == .picker {
+        // Пока зажата ПКМ, открыт выбор файла или тянется таймлайн —
+        // автоскрытие не тикает
+        if rightHeld || mode == .picker || scrubbing {
             lastActivity = CACurrentMediaTime()
             if rightHeld {
                 return
@@ -363,10 +376,10 @@ final class UIOverlay {
             releaseMouse(restorePosition: false)
             // Опускаем окно: диалог доступа мог оказаться под ним
             onWindowLevelRequest?(false)
-            showOSD("Снимите шлем: нужен ответ на запрос доступа")
+            showOSD("Запрос доступа к диску — ответьте в диалоге на мониторе")
             print("[player] Чтение тома затянулось — вероятно, macOS ждёт разрешения доступа.")
-            print("[player] Снимите шлем и посмотрите на мониторы; если диалога нет —")
-            print("[player] нажмите в панели кнопку «🔓 Доступ» и добавьте PSVR2 Player вручную.")
+            print("[player] Диалог должен появиться на мониторе; если его нет — нажмите")
+            print("[player] «Открыть настройки доступа» в окне подсказки на мониторе.")
         }
 
         if CACurrentMediaTime() - lastActivity > 3.0 {
@@ -374,9 +387,17 @@ final class UIOverlay {
             return
         }
 
-        // Перерисовка: смена ховера или тик прогресса
+        // Перерисовка: смена ховера или тик прогресса; над таймлайном чаще,
+        // чтобы плашка времени следовала за курсором
         let hovered = hitIndex()
-        if hovered != lastHovered || CACurrentMediaTime() - lastRedraw > 0.5 {
+        var maxAge = 0.5
+        if scrubbing {
+            scrubFraction = timelineFraction()
+            maxAge = 1.0 / 30
+        } else if hovered >= 0, case .timeline = buttons[hovered].action {
+            maxAge = 1.0 / 30
+        }
+        if hovered != lastHovered || CACurrentMediaTime() - lastRedraw > maxAge {
             redraw()
         }
     }
@@ -406,6 +427,7 @@ final class UIOverlay {
         active = true
         cursorU = 0.5
         cursorV = 0.5
+        renderer?.anchorPanel() // закрепить панель перед текущим взглядом
         captureMouse()
         redraw()
     }
@@ -464,20 +486,6 @@ final class UIOverlay {
         case .pickerDrives:
             loadDir(URL(fileURLWithPath: "/Volumes"))
             redrawSoon()
-        case .pickerAccess:
-            // «Полный доступ к диску» — единственный раздел, куда приложение
-            // можно добавить вручную кнопкой «+»
-            releaseMouse(restorePosition: false)
-            onWindowLevelRequest?(false)
-            releasedForDialog = true
-            if let url = URL(string:
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                NSWorkspace.shared.open(url)
-            }
-            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-            showOSD("Снимите шлем: добавьте приложение в настройках")
-            print("[player] Полный доступ к диску → «+» → перетащите PSVR2Player.app")
-            print("[player] Путь: \(Bundle.main.bundleURL.path)")
         case .pickerCancel:
             if renderer?.video != nil {
                 mode = .controls
@@ -486,8 +494,22 @@ final class UIOverlay {
             }
         case .showPicker:
             openPicker()
+        case .timeline:
+            guard durationSeconds() != nil else { return nil }
+            scrubbing = true
+            scrubFraction = timelineFraction()
+            redrawSoon()
         }
         return nil
+    }
+
+    // Отпускание ЛКМ: завершение перетаскивания таймлайна
+    func mouseUp() -> UIAction? {
+        guard scrubbing else { return nil }
+        scrubbing = false
+        markActivity()
+        redrawSoon()
+        return .seekFraction(scrubFraction)
     }
 
     func markActivity() {
@@ -499,6 +521,25 @@ final class UIOverlay {
     }
 
     // MARK: - Отрисовка
+
+    private func durationSeconds() -> Double? {
+        guard let d = renderer?.video?.player.currentItem?.duration,
+              d.isNumeric, d.seconds > 0 else { return nil }
+        return d.seconds
+    }
+
+    // Доля длительности под курсором (по горизонтали дорожки таймлайна)
+    private func timelineFraction() -> Double {
+        guard let b = buttons.first(where: { if case .timeline = $0.action { return true }
+                                             return false }) else { return 0 }
+        let track = trackRect(in: b.rect)
+        let x = cursorU * Double(Self.texW)
+        return max(0, min(1, (x - track.minX) / track.width))
+    }
+
+    private func trackRect(in rect: CGRect) -> CGRect {
+        CGRect(x: rect.minX + 18, y: rect.minY + 12, width: rect.width - 36, height: 12)
+    }
 
     private func timeString(_ t: CMTime) -> String {
         guard t.isNumeric else { return "--:--" }
@@ -539,6 +580,10 @@ final class UIOverlay {
 
         for (i, b) in buttons.enumerated() {
             let hovered = i == lastHovered
+            if case .timeline = b.action {
+                drawTimeline(ctx, rect: b.rect, showPreview: hovered || scrubbing)
+                continue
+            }
             ctx.addPath(CGPath(roundedRect: b.rect, cornerWidth: 14, cornerHeight: 14, transform: nil))
             if hovered {
                 ctx.setFillColor(CGColor(red: 0.36, green: 0.42, blue: 0.95, alpha: 0.95))
@@ -574,6 +619,46 @@ final class UIOverlay {
 
         NSGraphicsContext.restoreGraphicsState()
         upload(ctx)
+    }
+
+    private func drawTimeline(_ ctx: CGContext, rect: CGRect, showPreview: Bool) {
+        let track = trackRect(in: rect)
+        ctx.addPath(CGPath(roundedRect: track, cornerWidth: 6, cornerHeight: 6, transform: nil))
+        ctx.setFillColor(CGColor(red: 0.30, green: 0.32, blue: 0.38, alpha: 0.95))
+        ctx.fillPath()
+
+        guard let dur = durationSeconds(), let player = renderer?.video?.player else { return }
+        let current = player.currentTime().seconds
+        let played = scrubbing
+            ? scrubFraction
+            : max(0, min(1, (current.isFinite ? current : 0) / dur))
+
+        if played > 0 {
+            let fill = CGRect(x: track.minX, y: track.minY,
+                              width: track.width * played, height: track.height)
+            ctx.addPath(CGPath(roundedRect: fill, cornerWidth: 6, cornerHeight: 6, transform: nil))
+            ctx.setFillColor(CGColor(red: 0.36, green: 0.42, blue: 0.95, alpha: 1))
+            ctx.fillPath()
+        }
+
+        let knobX = track.minX + track.width * played
+        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        ctx.fillEllipse(in: CGRect(x: knobX - 14, y: track.midY - 14, width: 28, height: 28))
+
+        // Плашка со временем в точке курсора (при перетаскивании — в точке захвата)
+        if showPreview {
+            let f = scrubbing ? scrubFraction : timelineFraction()
+            let text = timeString(CMTime(seconds: dur * f, preferredTimescale: 600))
+            let plateW = 150.0, plateH = 34.0
+            let cx = min(max(track.minX + track.width * f, rect.minX + plateW / 2),
+                         rect.maxX - plateW / 2)
+            let plate = CGRect(x: cx - plateW / 2, y: rect.maxY - plateH,
+                               width: plateW, height: plateH)
+            ctx.addPath(CGPath(roundedRect: plate, cornerWidth: 10, cornerHeight: 10, transform: nil))
+            ctx.setFillColor(CGColor(red: 0.05, green: 0.06, blue: 0.08, alpha: 0.95))
+            ctx.fillPath()
+            drawText(text, in: plate, size: 24, color: .white)
+        }
     }
 
     private func drawOSDIfNeeded(_ ctx: CGContext) {

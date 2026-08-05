@@ -20,10 +20,11 @@ psvr2player: main.swift overlay.swift sweeper.swift meta.swift passthrough.swift
 
 # Бандл нужен не только для запуска из Finder: без Info.plist macOS не может
 # показать запрос доступа к внешним дискам, и чтение тома зависает навсегда
-$(APP): psvr2player Info.plist
-	mkdir -p $(APP)/Contents/MacOS
+$(APP): psvr2player Info.plist environment.jpg
+	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp Info.plist $(APP)/Contents/Info.plist
 	cp psvr2player $(APP)/Contents/MacOS/psvr2player
+	cp environment.jpg $(APP)/Contents/Resources/environment.jpg
 	codesign --force --deep --sign - $(APP)
 	@echo "Готово: $(APP) — запуск ./play [файл]"
 

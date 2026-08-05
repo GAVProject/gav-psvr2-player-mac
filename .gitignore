@@ -19,3 +19,5 @@ video/
 *.mkv
 
 .DS_Store
+
+.idea

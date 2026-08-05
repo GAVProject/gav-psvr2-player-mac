@@ -262,7 +262,10 @@ fragment float4 fs_main(VSOut in [[stage_in]],
             float2 ph = uni.p3.zw;
             float pu = (pDir.x / -pDir.z - disp - pc.x) / (2.0 * ph.x) + 0.5;
             float pv = (pDir.y / -pDir.z - pc.y) / (2.0 * ph.y) + 0.5;
-            if (pu >= 0.0 && pu <= 1.0 && pv >= 0.0 && pv <= 1.0) {
+            // Поле вокруг панели (значения согласованы с UIOverlay.marginU/V):
+            // курсор может выйти за край, клик там скрывает панель;
+            // текстура по краю прозрачная, clamp_to_edge не мажет
+            if (pu >= -0.05 && pu <= 1.05 && pv >= -0.10 && pv <= 1.10) {
                 float2 tuv = float2(pu, 1.0 - pv);
                 float4 uiC = ui.sample(smp, tuv);
 
@@ -889,6 +892,9 @@ final class Renderer: NSObject, MTKViewDelegate {
     let lutBuffer: MTLBuffer
     let placeholderY: MTLTexture
     let placeholderCbCr: MTLTexture
+    // Окружение вместо серой пустоты, пока файл не открыт: equirect-панорама
+    // 360° из Resources (CC0, Poly Haven), грузится в фоне после старта
+    private var envTexture: MTLTexture?
     let tracker = HeadTracker()
     var video: VideoSource?
     var config: PlaybackConfig
@@ -948,6 +954,16 @@ final class Renderer: NSObject, MTKViewDelegate {
             region: MTLRegionMake2D(0, 0, 2, 2), mipmapLevel: 0, withBytes: &chroma, bytesPerRow: 4)
 
         super.init()
+
+        // Декодирование 8k-панорамы небыстрое — не задерживаем запуск.
+        // SRGB=false: шейдер работает в гамма-пространстве, как и с видео
+        if let url = Bundle.main.url(forResource: "environment", withExtension: "jpg") {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let loader = MTKTextureLoader(device: device)
+                let tex = try? loader.newTexture(URL: url, options: [.SRGB: false])
+                DispatchQueue.main.async { self?.envTexture = tex }
+            }
+        }
     }
 
     private var lastButton = false
@@ -960,6 +976,12 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var lastProxRaw = true
     private var proxRawSince = CACurrentMediaTime()
     private var autoPaused = false
+    // На старте шлем обычно лежит снятым, и авторецентр по первой позе
+    // смотрит куда попало. Заметив «снят», при первом надевании повторяем
+    // рецентр, чтобы сцена и панель оказались перед глазами
+    private var wornRecenterArmed = false
+    private var didWornRecenter = false
+    private var reanchorPanel = false
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
@@ -999,6 +1021,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         overlay?.clearOSD()
     }
 
+    // Стоп: закрыть файл (позицию запоминаем) и вернуться к списку файлов
+    func stopVideo() {
+        guard let v = video else { return }
+        v.savePosition()
+        v.stop()
+        video = nil
+        autoPaused = false
+        pausedByPassthrough = false
+        print("[player] стоп — файл закрыт")
+        overlay?.openPicker()
+    }
+
     // Закрепить панель перед текущим взглядом (горизонт сохраняем)
     func anchorPanel() {
         let f = tracker.viewQuat.act(SIMD3<Float>(0, 0, -1))
@@ -1019,9 +1053,25 @@ final class Renderer: NSObject, MTKViewDelegate {
             lastProxRaw = raw
             proxRawSince = now
         }
+
+        // Первое надевание после запуска со снятым шлемом — рецентр
+        if !didWornRecenter {
+            if !raw {
+                wornRecenterArmed = true
+            } else if wornRecenterArmed && now - proxRawSince > 0.4 {
+                didWornRecenter = true
+                tracker.requestRecenter()
+                reanchorPanel = true
+                print("[player] шлем надет — сцена и панель по взгляду")
+            }
+        }
+
         // Состояние принимается после 0.4 с стабильности
         guard raw != wornState, now - proxRawSince > 0.4 else { return }
         wornState = raw
+        // Мышь нужна плееру только пока шлем на голове: снял — курсор
+        // свободен, никакого альт-таба ради мыши
+        overlay?.setWorn(wornState)
 
         guard let player = video?.player else { return }
         if !wornState {
@@ -1084,6 +1134,11 @@ final class Renderer: NSObject, MTKViewDelegate {
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
         let rot = tracker.viewRotation()
+        // Якорим панель после применения рецентра (viewQuat уже свежий)
+        if reanchorPanel {
+            reanchorPanel = false
+            anchorPanel()
+        }
         let gyroW = scanlineEnabled ? tracker.worldAngularVelocity : .zero
 
         // Панель закреплена в мире; одиночная плашка OSD — приклеена к взгляду
@@ -1100,16 +1155,20 @@ final class Renderer: NSObject, MTKViewDelegate {
             panelInv = rot.transpose
         }
 
+        // Без открытого файла показываем панораму окружения: она идёт по
+        // видеотракту шейдера как 360°-моно-BGRA «видео»
+        let env = video == nil ? envTexture : nil
+
         var uni = Uniforms(
             rot: rot,
             panelInv: panelInv,
             calibL: SIMD4(calibration[0], calibration[1], calibration[4], calibration[5]),
             calibR: SIMD4(calibration[2], calibration[3], calibration[6], calibration[7]),
             p0: SIMD4(
-                Float(config.projection.rawValue),
-                Float(config.stereo.rawValue),
+                Float((env != nil ? .equirect360 : config.projection).rawValue),
+                Float((env != nil ? .mono : config.stereo).rawValue),
                 config.fisheyeFovDeg * .pi / 180,
-                config.flipV),
+                env != nil ? 1 : config.flipV),
             p1: SIMD4(gyroW.x, gyroW.y, gyroW.z, scanoutDuration),
             p2: SIMD4(
                 chromaticEnabled ? 1 : 0,
@@ -1120,10 +1179,10 @@ final class Renderer: NSObject, MTKViewDelegate {
                 Float((overlay?.active ?? false) ? overlay!.cursorV : -10)),
             p3: SIMD4(panelCenter.x, panelCenter.y, panelHalf.x, panelHalf.y),
             p4: SIMD4(
-                video?.textureY != nil ? 1 : 0,
+                video?.textureY != nil || env != nil ? 1 : 0,
                 (video?.fullRange ?? false) ? 1 : 0,
                 (video?.bt2020 ?? false) ? 1 : 0,
-                (video?.isBGRA ?? false) ? 1 : 0),
+                video?.isBGRA ?? false || env != nil ? 1 : 0),
             p5: SIMD4(
                 (passthrough?.gotFrame ?? false) ? 1 : 0,
                 (passthrough?.fovDeg ?? 150) * .pi / 180,
@@ -1134,7 +1193,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
         enc.setFragmentBuffer(lutBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(video?.textureY ?? placeholderY, index: 0)
+        enc.setFragmentTexture(video?.textureY ?? env ?? placeholderY, index: 0)
         enc.setFragmentTexture(overlay?.texture ?? placeholderY, index: 1)
         enc.setFragmentTexture(video?.textureCbCr ?? placeholderCbCr, index: 2)
         enc.setFragmentTexture(passthrough?.textureL ?? placeholderY, index: 3)
@@ -1567,17 +1626,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 632)
+        let size = NSSize(width: 620, height: 578)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
             width: size.width, height: size.height)
 
         let win = NSWindow(
-            contentRect: frame, styleMask: [.titled, .miniaturizable],
+            contentRect: frame, styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered, defer: false, screen: deskScreen)
         win.title = "PSVR2 Player — пульт"
         win.isReleasedWhenClosed = false
+        // Крестик пульта закрывает весь плеер — как клавиша Q
+        NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: win, queue: .main) { _ in
+            NSApp.terminate(nil)
+        }
         let content = win.contentView!
 
         func label(_ s: String, size: CGFloat = 12.5, color: NSColor = .labelColor,
@@ -1651,13 +1715,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         footer.font = .systemFont(ofSize: 11.5)
         footer.textColor = .tertiaryLabelColor
 
-        let openBtn = NSButton(title: "Открыть видео…", target: self,
-                               action: #selector(openVideoFromMonitor))
-        openBtn.bezelStyle = .rounded
-        openBtn.controlSize = .large
-        openBtn.font = .systemFont(ofSize: 15, weight: .semibold)
-
-        for v in [grid, footer, openBtn] {
+        for v in [grid, footer] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -1668,8 +1726,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             footer.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 14),
             footer.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
             footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
-            openBtn.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            openBtn.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -14),
         ])
 
         win.makeKeyAndOrderFront(nil)
@@ -1733,19 +1789,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("chrom", r.chromaticEnabled ? "вкл" : "выкл")
         set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)
             ? "вкл" : "выкл")
-    }
-
-    // Выбор видео стандартным диалогом на мониторе
-    @objc private func openVideoFromMonitor() {
-        let panel = NSOpenPanel()
-        panel.allowedFileTypes = ["mp4", "m4v", "mov"]
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.level = .floating // не ниже других окон захваченного стола
-        panel.begin { [weak self] resp in
-            guard resp == .OK, let url = panel.url else { return }
-            self?.loadVideo(url)
-        }
     }
 
     // Сторож: чужие окна, попавшие на дисплей шлема, переносим на монитор

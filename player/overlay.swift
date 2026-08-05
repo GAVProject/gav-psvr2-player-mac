@@ -25,13 +25,18 @@ final class UIOverlay {
     static let texW = 1024
     static let texH = 512
 
+    // Поле вокруг панели, доступное курсору (доли текстуры; те же значения
+    // зашиты в шейдере) — клик по нему скрывает панель
+    static let marginU = 0.05
+    static let marginV = 0.10
+
     private enum PanelMode { case controls, picker, format }
 
     private enum ButtonAction {
         case ui(UIAction)
         case pickerEntry(Int)
         case pickerUp, pickerDown, pickerCancel, pickerDrives
-        case showPicker
+        case stopVideo // закрыть файл и вернуться к списку
         case timeline
         // Подменю «Формат»: явный выбор вместо циклирования
         case showFormat, formatDone
@@ -96,9 +101,16 @@ final class UIOverlay {
     private var loadToken = 0
     private var mouseCaptured = false
     private var releasedForDialog = false
+    // Шлем на голове (датчик приближения): снятый шлем — обычная работа
+    // за маком, мышь не трогаем и панель не будим
+    private var hmdWorn = true
 
     private var lastActivity = CACurrentMediaTime()
     private var lastRedraw = 0.0
+    // Накопитель движения для пробуждения панели: фильтрует дрожание мыши
+    private var wakeAccum = 0.0
+    private var lastWakeMove = 0.0
+    private var lastButtonHeld = 0.0
     private var savedMousePos: CGPoint?
     private var lastHovered: Int = -1
 
@@ -168,7 +180,7 @@ final class UIOverlay {
             Button(rect: rect(1, 1), label: { "Тише" }, action: .ui(.volDown)),
             Button(rect: rect(2, 1), label: { "Громче" }, action: .ui(.volUp)),
             Button(rect: rect(3, 1), label: { "Рецентр" }, action: .ui(.recenter)),
-            Button(rect: rect(0, 2), label: { "Файл…" }, action: .showPicker),
+            Button(rect: rect(0, 2), label: { "⏹ Стоп" }, action: .stopVideo),
             Button(rect: rect(1, 2, span: 2), label: { [weak self] in
                 guard let cfg = self?.renderer?.config else { return "Формат…" }
                 return "Формат: \(cfg.projection.shortLabel) · \(cfg.stereo.shortLabel)"
@@ -326,6 +338,7 @@ final class UIOverlay {
                     self.releasedForDialog = false
                     self.onWindowLevelRequest?(true)
                     self.captureMouse()
+                    self.clearOSD() // диалог отвечен — снимаем подсказку
                 }
                 self.buildPickerButtons()
                 self.redrawSoon()
@@ -406,15 +419,64 @@ final class UIOverlay {
         // Пока зажата правая кнопка, мышь крутит сцену: курсор панели не
         // двигаем и панель не показываем
         let rightHeld = NSEvent.pressedMouseButtons & 0x2 != 0
+        // Любая кнопка мыши: во время нажатия и полсекунды после него
+        // движение не будит панель — клик всегда чуть сдвигает мышь
+        if NSEvent.pressedMouseButtons != 0 {
+            lastButtonHeld = CACurrentMediaTime()
+        }
 
         if moved && NSApp.isActive {
             lastActivity = CACurrentMediaTime()
             if active && !rightHeld {
-                cursorU = min(1, max(0, cursorU + Double(dx) / 900.0))
-                cursorV = min(1, max(0, cursorV + Double(dy) / 450.0))
-            } else if !active && !rightHeld && renderer?.passthrough?.active != true {
+                cursorU = min(1 + Self.marginU, max(-Self.marginU, cursorU + Double(dx) / 900.0))
+                cursorV = min(1 + Self.marginV, max(-Self.marginV, cursorV + Double(dy) / 450.0))
+            } else if !active && !rightHeld && hmdWorn
+                        && renderer?.passthrough?.active != true {
                 // В режиме камер интерфейса нет вовсе: панель не появляется
-                // и мышь не перехватывается — можно просто осмотреться
+                // и мышь не перехватывается — можно просто осмотреться.
+                // Микросдвиг от клика/отпускания кнопки панель не будит:
+                // рядом с нажатием движение игнорируем целиком, а без него
+                // требуем накопить заметный путь без долгих пауз
+                let now = CACurrentMediaTime()
+                if now - lastButtonHeld < 0.5 {
+                    wakeAccum = 0
+                } else {
+                    if now - lastWakeMove > 0.3 {
+                        wakeAccum = 0
+                    }
+                    lastWakeMove = now
+                    wakeAccum += Double(abs(dx) + abs(dy))
+                    if wakeAccum > 15 {
+                        show()
+                    }
+                }
+            }
+        }
+
+        // Долгое чтение тома: macOS показала запрос доступа на мониторе.
+        // Диалог уводит фокус у приложения, поэтому проверка стоит до всех
+        // выходов по NSApp.isActive и видимости панели — иначе подсказка
+        // не покажется именно тогда, когда нужна
+        if loading && !releasedForDialog && CACurrentMediaTime() - loadStarted > 1.5 {
+            releasedForDialog = true
+            releaseMouse(restorePosition: false)
+            // Опускаем окно: диалог доступа мог оказаться под ним
+            onWindowLevelRequest?(false)
+            // Висит, пока диалог не отвечен (снимается в конце loadDir)
+            showOSD("Подтвердите доступ в диалоге на основном мониторе", duration: 3600)
+            print("[player] Чтение тома затянулось — вероятно, macOS ждёт разрешения доступа.")
+            print("[player] Диалог должен появиться на мониторе; если его нет — нажмите")
+            print("[player] «Открыть настройки доступа» в окне подсказки на мониторе.")
+        }
+
+        // Без открытого видео скрытая панель — пустая серая сцена: надевший
+        // шлем не догадается двинуть мышью, поэтому список файлов держим
+        // на экране сам
+        if !active && hmdWorn && NSApp.isActive && renderer?.video == nil
+            && renderer?.passthrough?.active != true {
+            if mode != .picker {
+                openPicker()
+            } else {
                 show()
             }
         }
@@ -443,19 +505,6 @@ final class UIOverlay {
             }
         }
 
-        // Долгое чтение тома: macOS могла показать запрос доступа на мониторе —
-        // отпускаем мышь, чтобы на него можно было ответить
-        if loading && !releasedForDialog && CACurrentMediaTime() - loadStarted > 1.5 {
-            releasedForDialog = true
-            releaseMouse(restorePosition: false)
-            // Опускаем окно: диалог доступа мог оказаться под ним
-            onWindowLevelRequest?(false)
-            showOSD("Запрос доступа к диску — ответьте в диалоге на мониторе")
-            print("[player] Чтение тома затянулось — вероятно, macOS ждёт разрешения доступа.")
-            print("[player] Диалог должен появиться на мониторе; если его нет — нажмите")
-            print("[player] «Открыть настройки доступа» в окне подсказки на мониторе.")
-        }
-
         if CACurrentMediaTime() - lastActivity > 3.0 {
             hide()
             return
@@ -476,8 +525,19 @@ final class UIOverlay {
         }
     }
 
+    // Смена состояния датчика приближения (уже с дебаунсом в Renderer)
+    func setWorn(_ worn: Bool) {
+        guard worn != hmdWorn else { return }
+        hmdWorn = worn
+        if !worn {
+            hide() // прячет панель и освобождает мышь
+        } else if active {
+            captureMouse()
+        }
+    }
+
     private func captureMouse() {
-        guard captureEnabled, !mouseCaptured else { return }
+        guard captureEnabled, hmdWorn, !mouseCaptured else { return }
         mouseCaptured = true
         savedMousePos = CGEvent(source: nil)?.location
         if let warp = warpPoint {
@@ -533,8 +593,9 @@ final class UIOverlay {
         lastActivity = CACurrentMediaTime()
         let idx = hitIndex()
         guard idx >= 0 else {
-            // Клик мимо кнопок в режиме управления — скрыть панель
-            if mode == .controls {
+            // Клик мимо кнопок (или по полю вокруг панели) — скрыть панель.
+            // Без открытого видео список файлов не прячем: за ним пустая сцена
+            if renderer?.video != nil || mode != .picker {
                 hide()
             }
             return nil
@@ -574,8 +635,8 @@ final class UIOverlay {
                 metaCache.cancelPending()
                 redrawSoon()
             }
-        case .showPicker:
-            openPicker()
+        case .stopVideo:
+            renderer?.stopVideo() // сам откроет список файлов
         case .showFormat:
             mode = .format
             buildFormatButtons()
@@ -848,12 +909,21 @@ final class UIOverlay {
 
     private func drawOSDIfNeeded(_ ctx: CGContext) {
         guard osdActive, let text = osdText else { return }
-        let w = 440.0, h = 72.0
+        // Плашка подстраивается под текст; совсем длинный — мельче шрифтом
+        var fontSize = 34.0
+        var textW = Double(NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: fontSize, weight: .semibold)]).size().width)
+        let maxTextW = Double(Self.texW) - 88
+        if textW > maxTextW {
+            fontSize *= maxTextW / textW
+            textW = maxTextW
+        }
+        let w = max(440.0, textW + 48), h = 72.0
         let rect = CGRect(x: (Double(Self.texW) - w) / 2, y: Double(Self.texH) - h - 14, width: w, height: h)
         ctx.addPath(CGPath(roundedRect: rect, cornerWidth: 20, cornerHeight: 20, transform: nil))
         ctx.setFillColor(CGColor(red: 0.07, green: 0.08, blue: 0.10, alpha: 0.9))
         ctx.fillPath()
-        drawText(text, in: rect, size: 34, color: .white)
+        drawText(text, in: rect, size: fontSize, color: .white)
     }
 
     private func upload(_ ctx: CGContext) {

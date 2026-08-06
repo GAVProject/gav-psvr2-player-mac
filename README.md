@@ -14,8 +14,10 @@ Tested on: MacBook Air M4, macOS 15+, PSVR2 + PC adapter (DP cable + USB).
 
 The adapter is mandatory. Plugging the headset cable straight into a Mac
 Thunderbolt port doesn't even power it up (no standby LED, nothing appears
-on USB) — the Mac port supplies at most 15 W, the headset needs more, and the
-power comes from the adapter's brick. No software can work around that.
+on USB). The headset's USB-C plug follows the VirtualLink spec — its own
+pin-out and 12 V power delivery, distinct from regular USB-C PD / DP Alt
+Mode — which a Thunderbolt port doesn't speak. The adapter (with its power
+brick) bridges that gap. No software can work around it.
 
 ## Features
 

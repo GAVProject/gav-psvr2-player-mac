@@ -724,6 +724,20 @@ final class VideoSource {
             }
             guard err == noErr else { continue }
             if (name as String).contains("PS VR2") || (name as String).contains("PSVR2") {
+                // The headset exposes more than one device under this name,
+                // including its input-only mic. Routing AVPlayer's output to
+                // a device with no output streams silently breaks audio
+                // rendering — which stalls playback entirely, since
+                // AVPlayer's clock is normally driven by the audio output
+                var streamAddr = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyStreams,
+                    mScope: kAudioObjectPropertyScopeOutput,
+                    mElement: kAudioObjectPropertyElementMain)
+                var streamSize: UInt32 = 0
+                let hasOutput = AudioObjectGetPropertyDataSize(id, &streamAddr, 0, nil, &streamSize) == noErr
+                    && streamSize > 0
+                guard hasOutput else { continue }
+
                 var uidAddr = AudioObjectPropertyAddress(
                     mSelector: kAudioDevicePropertyDeviceUID,
                     mScope: kAudioObjectPropertyScopeGlobal,

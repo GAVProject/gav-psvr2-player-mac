@@ -112,7 +112,9 @@ In macOS Settings, set the "PS VR2" display to 120 Hz.
 Keys: `Space` pause · `R`/Fn button on the headset — recenter (long-press Fn
 centers the video on your gaze, handy when lying down; double-press — camera
 view) · `B` camera view (`M` stereo/mono, `,`/`.` convergence) ·
-`F` projection · `G` stereo · `V` vertical flip · `←/→` ±15 s · `↑/↓` volume ·
+`F` projection · `G` stereo · `V` vertical flip · `,`/`.` stereo depth (pushes
+an uncomfortably close scene away; separate from camera convergence) ·
+`←/→` ±15 s · `↑/↓` volume ·
 `+/-` fisheye FOV or camera lens angle · `Q` quit.
 Mouse: move — panel · click — select · right-drag — tilt scene ·
 wheel — scroll list. Trackpad: two-finger scroll — list, two-finger

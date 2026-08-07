@@ -46,14 +46,14 @@ struct Uniforms {
     float4 p3;       // panel in tan space: center (xy), half-sizes (zw)
     float4 p4;       // x: has video, y: full-range YUV, z: BT.2020, w: BGRA frame
     float4 p5;       // x: passthrough on, y: camera FOV (rad), z: brightness, w: camera mode
-    float4 p6;       // x: camera convergence (fraction of frame)
+    float4 p6;       // x: camera convergence, y: video stereo depth (fractions of frame)
 };
 
 constant float FX = 0.3585564;
 constant float FY = 0.3762281;
 constant float PI = 3.14159265358979;
 
-static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad, thread bool &valid) {
+static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad, float shift, thread bool &valid) {
     float u, v;
     valid = true;
     if (mode == 2) {
@@ -78,6 +78,11 @@ static float2 project_dir(float3 w, int mode, int stereo, int eye, float fovRad,
             u = lon / (2.0 * PI) + 0.5;
         }
         v = 0.5 - lat / PI;
+    }
+    // Stereo depth: shift the eye images horizontally toward/away from each
+    // other (inside each eye's own frame) to push a too-close scene back
+    if (shift != 0.0) {
+        u = clamp(u + shift, 0.0, 1.0);
     }
     if (stereo == 1) {
         u = u * 0.5 + (eye == 1 ? 0.5 : 0.0);
@@ -184,8 +189,11 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float3 w = (uni.rot * float4(dir, 0.0)).xyz;
         w = normalize(w + cross(gyroW, w) * rowTime);
 
+        // p6.y — video depth: per-eye shift, mirrored between the eyes;
+        // positive pushes the scene away, zero (default) leaves it untouched
+        float depthShift = stereo == 0 ? 0.0 : (eye == 0 ? uni.p6.y : -uni.p6.y);
         bool valid;
-        float2 uv = project_dir(w, mode, stereo, eye, fovRad, valid);
+        float2 uv = project_dir(w, mode, stereo, eye, fovRad, depthShift, valid);
         if (!valid) {
             continue;
         }
@@ -339,6 +347,11 @@ struct PlaybackConfig {
     var stereo = StereoLayout.sbs
     var fisheyeFovDeg: Float = 190
     var flipV: Float = 1
+    // Stereo depth: horizontal shift of the eye images (fraction of the
+    // per-eye frame). Positive pushes the scene away — for videos with
+    // uncomfortably close shots. Separate from the passthrough convergence;
+    // resets to 0 for every opened file
+    var depth: Float = 0
 
     // Guess the format from the file name
     static func detect(from name: String) -> PlaybackConfig {
@@ -1191,7 +1204,7 @@ final class Renderer: NSObject, MTKViewDelegate {
                 (passthrough?.fovDeg ?? 150) * .pi / 180,
                 passthrough?.brightness ?? 1.6,
                 Float(passthrough?.source.rawValue ?? 0)),
-            p6: SIMD4(passthrough?.convergence ?? 0, 0, 0, 0))
+            p6: SIMD4(passthrough?.convergence ?? 0, env != nil ? 0 : config.depth, 0, 0))
 
         enc.setRenderPipelineState(pipeline)
         enc.setFragmentBytes(&uni, length: MemoryLayout<Uniforms>.stride, index: 0)
@@ -1277,12 +1290,17 @@ final class PlayerView: MTKView {
             pt.source = all[(all.firstIndex(of: pt.source)! + 1) % all.count]
             r.overlay?.showOSD(pt.source.label)
             print("[passthrough] mode: \(pt.source.label)")
-        case 43, 47: // "," and "." — image convergence (camera baseline compensation)
-            guard let pt = r.passthrough, pt.active else { break }
-            pt.convergence = max(-0.15, min(0.15,
-                pt.convergence + (event.keyCode == 47 ? 0.005 : -0.005)))
-            r.overlay?.showOSD(String(format: "Convergence: %+.3f", pt.convergence))
-            print(String(format: "[passthrough] convergence: %+.3f", pt.convergence))
+        case 43, 47: // "," and "." — in camera view: convergence; in video: stereo depth
+            let delta: Float = event.keyCode == 47 ? 0.005 : -0.005
+            if let pt = r.passthrough, pt.active {
+                pt.convergence = max(-0.15, min(0.15, pt.convergence + delta))
+                r.overlay?.showOSD(String(format: "Convergence: %+.3f", pt.convergence))
+                print(String(format: "[passthrough] convergence: %+.3f", pt.convergence))
+            } else if r.video != nil, r.config.stereo != .mono {
+                r.config.depth = max(-0.1, min(0.1, r.config.depth + delta))
+                r.overlay?.showOSD(String(format: "Depth: %+.3f", r.config.depth))
+                print(String(format: "[player] stereo depth: %+.3f", r.config.depth))
+            }
         case 123: // ←
             seek(by: -15)
         case 124: // →
@@ -1692,6 +1710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addRow("Projection", id: "proj", key: "F")
         addRow("Stereo", id: "stereo", key: "G")
         addRow("Vertical flip", id: "flip", key: "V")
+        addRow("Stereo depth", id: "depth", key: ", / .")
         addRow("Fisheye FOV", id: "fov", key: "+ / −")
         addHeader("Cameras (passthrough)")
         addRow("Mode", id: "pt", key: "B · double Fn")
@@ -1776,6 +1795,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("proj", cfg.projection.label)
         set("stereo", cfg.stereo.label)
         set("flip", cfg.flipV < 0 ? "on" : "off")
+        set("depth", cfg.depth == 0 ? "0 (default)" : String(format: "%+.3f", cfg.depth))
         set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
 
         if let pt = r.passthrough {

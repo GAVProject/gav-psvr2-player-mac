@@ -1515,6 +1515,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var keyMonitor: Any?
     var cvLink: CVDisplayLink?
     var headsetDisplayID: CGDirectDisplayID = 0
+    // No headset display at launch — rendering to a window on the monitor
+    var runningInPreview = false
+
+    static func findVRScreen() -> NSScreen? {
+        NSScreen.screens.first {
+            $0.localizedName.localizedCaseInsensitiveContains("PS VR2")
+                || ($0.frame.width * $0.backingScaleFactor) == 4000
+        }
+    }
+
+    // The headset is plugged in but mirrors another display: it doesn't show
+    // up in NSScreen.screens, and mirroring can't carry per-eye stereo anyway
+    static func vrDisplayIsMirrored() -> Bool {
+        var count: UInt32 = 0
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        guard CGGetOnlineDisplayList(UInt32(ids.count), &ids, &count) == .success else { return false }
+        for id in ids.prefix(Int(count)) where CGDisplayMirrorsDisplay(id) != 0 {
+            if CGDisplayVendorNumber(id) == 0x4DD9 { return true } // EDID "SNY"
+            let modes = CGDisplayCopyAllDisplayModes(id, nil) as? [CGDisplayMode] ?? []
+            if modes.contains(where: { $0.pixelWidth == 4000 }) { return true }
+        }
+        return false
+    }
     var playerView: PlayerView?
     var accessHelperWindow: NSWindow?
     // Remote-control window on the regular monitor: holds keyboard focus so
@@ -1549,10 +1572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Headset screen
-        let vrScreen = NSScreen.screens.first {
-            $0.localizedName.localizedCaseInsensitiveContains("PS VR2")
-                || ($0.frame.width * $0.backingScaleFactor) == 4000
-        }
+        let vrScreen = Self.findVRScreen()
         let screen = vrScreen ?? NSScreen.main!
         if vrScreen == nil {
             print("[display] !!! PS VR2 display not found — output to a window on the main screen")
@@ -1584,6 +1604,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onTop ? self?.hideAccessHelper() : self?.showAccessHelper()
         }
         renderer.overlay = overlay
+
+        if vrScreen == nil {
+            runningInPreview = true
+            // Keep the hint on screen until the headset shows up (any later
+            // OSD message simply replaces it)
+            overlay.showOSD(
+                Self.vrDisplayIsMirrored()
+                    ? "PS VR2 mirrors the monitor — set it to \u{201C}Extended display\u{201D} in Displays settings"
+                    : "Headset not found — power on PS VR2, then restart the player",
+                duration: 3600)
+        }
 
         if let url = videoURL {
             loadVideo(url)
@@ -1649,7 +1680,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, let mode = CGDisplayCopyDisplayMode(self.headsetDisplayID) else { return }
+            guard let self else { return }
+            // Headset plugged in while running in preview: the window layout,
+            // display link and USB session are built at launch, so ask for a
+            // restart instead of migrating on the fly
+            if self.runningInPreview {
+                if Self.findVRScreen() != nil {
+                    self.renderer.overlay?.showOSD(
+                        "PS VR2 detected — restart the player to use the headset", duration: 3600)
+                } else if Self.vrDisplayIsMirrored() {
+                    self.renderer.overlay?.showOSD(
+                        "PS VR2 mirrors the monitor — set it to \u{201C}Extended display\u{201D} in Displays settings",
+                        duration: 3600)
+                }
+            }
+            guard let mode = CGDisplayCopyDisplayMode(self.headsetDisplayID) else { return }
             self.renderer.setPanelRate(hz: mode.refreshRate)
         }
         if vrScreen != nil {

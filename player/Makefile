@@ -1,5 +1,6 @@
-LIBUSB_CFLAGS = -I/opt/homebrew/include/libusb-1.0
-LIBUSB_LDFLAGS = -L/opt/homebrew/lib -lusb-1.0
+BREW_PREFIX := $(shell brew --prefix)
+LIBUSB_CFLAGS = -I$(BREW_PREFIX)/include/libusb-1.0
+LIBUSB_LDFLAGS = -L$(BREW_PREFIX)/lib -lusb-1.0
 
 APP = PSVR2Player.app
 

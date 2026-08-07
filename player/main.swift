@@ -389,12 +389,13 @@ final class HeadTracker {
     private let correction = simd_quatf(ix: 0, iy: 0, iz: sqrt(0.5), r: sqrt(0.5))
     var connected = false
     var predictionEnabled = true
-    // Output latency: render + display scanout (adjusted with [ and ])
+    // Output latency: render + display scanout (adjusted with [ and ]).
+    // The default follows the panel rate — see Renderer.setPanelRate
     var extraLookaheadS: Float = 0.010
 
     // Orientation in x-right, y-up, -z-forward space (Monado axes)
     private func currentOrientation() -> simd_quatf? {
-        // SLAM updates at ~60 Hz, render at 120 Hz: the C core integrates the
+        // SLAM updates at ~60 Hz, render at the panel rate (90/120 Hz): the C core integrates the
         // pose forward with IMU samples (2000 Hz) and extrapolates by the
         // output latency
         if predictionEnabled {
@@ -929,8 +930,21 @@ final class Renderer: NSObject, MTKViewDelegate {
     // Panel anchor in world space: gaze direction (yaw+pitch, no roll)
     // at the moment it was shown
     private var panelAnchor = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-    // Panel scanout: 2040/2200 of the frame's rows at 120 Hz (from the Monado driver)
-    let scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
+    // Panel scanout: 2040/2200 of the frame's rows per refresh period (from
+    // the Monado driver). The headset runs at 120 or 90 Hz — the duration
+    // follows the active display mode (see setPanelRate)
+    private(set) var panelHz: Float = 120
+    private(set) var scanoutDuration: Float = (1.0 / 120.0) * (2040.0 / 2200.0)
+
+    func setPanelRate(hz: Double) {
+        guard hz > 30, abs(Float(hz) - panelHz) > 0.5 else { return }
+        panelHz = Float(hz)
+        scanoutDuration = (1.0 / panelHz) * (2040.0 / 2200.0)
+        // Default lookahead ≈ 1.2 frames: 10 ms at 120 Hz, 13.3 ms at 90 Hz
+        tracker.extraLookaheadS = 1.2 / panelHz
+        print(String(format: "[display] panel mode %.0f Hz: scanout %.1f ms, lookahead %.1f ms",
+            hz, scanoutDuration * 1000, tracker.extraLookaheadS * 1000))
+    }
 
     // Diagnostics
     private var statFrames = 0
@@ -1483,6 +1497,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var renderer: Renderer!
     var keyMonitor: Any?
     var cvLink: CVDisplayLink?
+    var headsetDisplayID: CGDirectDisplayID = 0
     var playerView: PlayerView?
     var accessHelperWindow: NSWindow?
     // Remote-control window on the regular monitor: holds keyboard focus so
@@ -1606,9 +1621,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // CADisplayLink/MTKView may tick from another (60 Hz) screen
         let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as! NSNumber
         let displayID = CGDirectDisplayID(truncating: screenNumber)
+        headsetDisplayID = displayID
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             print("[display] Headset display refresh rate per CoreGraphics: \(mode.refreshRate) Hz, "
                 + "screen maxFPS: \(screen.maximumFramesPerSecond)")
+            renderer.setPanelRate(hz: mode.refreshRate > 0 ? mode.refreshRate : Double(screen.maximumFramesPerSecond))
+        }
+        // The mode can change mid-run (90 ↔ 120 Hz in Displays settings);
+        // CVDisplayLink follows the display by itself, scanout/lookahead don't
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, let mode = CGDisplayCopyDisplayMode(self.headsetDisplayID) else { return }
+            self.renderer.setPanelRate(hz: mode.refreshRate)
         }
         if vrScreen != nil {
             startWindowSweeper(vrScreen: screen)

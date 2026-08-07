@@ -736,7 +736,10 @@ final class VideoSource {
                 var streamSize: UInt32 = 0
                 let hasOutput = AudioObjectGetPropertyDataSize(id, &streamAddr, 0, nil, &streamSize) == noErr
                     && streamSize > 0
-                guard hasOutput else { continue }
+                guard hasOutput else {
+                    print("[audio] skipping input-only device: \(name)")
+                    continue
+                }
 
                 var uidAddr = AudioObjectPropertyAddress(
                     mSelector: kAudioDevicePropertyDeviceUID,

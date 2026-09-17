@@ -25,6 +25,11 @@
 /* Camera frame header ('V','I'), followed by two BC4 planes */
 #define CAMERA_HEADER_BYTES 256
 
+/* SLAM poses arrive at ~60 Hz. No pose for this long means the stream is dead
+ * (USB unplugged, read thread exited) — the pose is reported as invalid
+ * instead of freezing on the last one forever */
+#define POSE_STALE_S 0.5
+
 #define GYRO_SCALE (2000.0f / 32767.0f)
 #define DEG_TO_RAD(d) ((d) * (float)M_PI / 180.0f)
 
@@ -144,6 +149,12 @@ static double monotonic_s(void)
 	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* Call with g_lock held */
+static int pose_valid(void)
+{
+	return g_have_pose && monotonic_s() - g_slam_time < POSE_STALE_S;
+}
+
 static void *slam_thread_fn(void *arg)
 {
 	(void)arg;
@@ -197,6 +208,9 @@ static void *status_thread_fn(void *arg)
 			continue;
 		}
 		if (ret != 0) {
+			if (g_running) {
+				fprintf(stderr, "psvr2: status read error: %s\n", libusb_error_name(ret));
+			}
 			break;
 		}
 		if (transferred < (int)sizeof(struct status_record_hdr)) {
@@ -378,7 +392,10 @@ void psvr2_stop(void)
 
 int psvr2_connected(void)
 {
-	return g_running && g_have_pose;
+	pthread_mutex_lock(&g_lock);
+	int valid = pose_valid();
+	pthread_mutex_unlock(&g_lock);
+	return g_running && valid;
 }
 
 int psvr2_get_pose(float quat_wxyz[4], float pos_xyz[3])
@@ -386,7 +403,7 @@ int psvr2_get_pose(float quat_wxyz[4], float pos_xyz[3])
 	pthread_mutex_lock(&g_lock);
 	memcpy(quat_wxyz, g_quat, sizeof(g_quat));
 	memcpy(pos_xyz, g_pos, sizeof(g_pos));
-	int have = g_have_pose;
+	int have = pose_valid();
 	pthread_mutex_unlock(&g_lock);
 	return have;
 }
@@ -405,7 +422,7 @@ int psvr2_get_motion(float gyro_radps[3], double *slam_age_s)
 	pthread_mutex_lock(&g_lock);
 	memcpy(gyro_radps, g_gyro, sizeof(g_gyro));
 	*slam_age_s = g_have_pose ? monotonic_s() - g_slam_time : 0.0;
-	int have = g_have_pose;
+	int have = pose_valid();
 	pthread_mutex_unlock(&g_lock);
 	return have;
 }
@@ -413,7 +430,7 @@ int psvr2_get_motion(float gyro_radps[3], double *slam_age_s)
 int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 {
 	pthread_mutex_lock(&g_lock);
-	if (!g_have_pose) {
+	if (!pose_valid()) {
 		pthread_mutex_unlock(&g_lock);
 		return 0;
 	}

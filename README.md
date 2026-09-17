@@ -103,9 +103,9 @@ To open a specific file right away, pass it as an argument:
 player/play "video_180_SBS.mp4"
 ```
 
-`play` keeps the log in your terminal; when launched from Finder/Dock the
-log goes to `~/Library/Logs/PSVR2Player.log` (watch with `tail -f` or
-Console.app).
+The log is written to `~/Library/Logs/PSVR2Player.log`; `play` streams it to
+your terminal, and after a Finder/Dock launch you can watch it with `tail -f`
+or Console.app.
 
 In macOS Settings, set the "PS VR2" display to 120 Hz.
 

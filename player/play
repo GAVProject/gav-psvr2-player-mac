@@ -2,12 +2,13 @@
 # Launch the player as a standalone application (via open), not as a child
 # process of the terminal. This matters for external-disk access: otherwise
 # macOS considers the terminal "responsible" and requests permissions on its behalf.
-# The application log is streamed here as well.
+# The application log is streamed here as well: without a terminal on stdout
+# the player writes it to ~/Library/Logs/PSVR2Player.log (see main.swift).
 cd "$(dirname "$0")"
 
 APP="$PWD/PSVR2Player.app"
 BIN="$APP/Contents/MacOS/psvr2player"
-LOG="${TMPDIR:-/tmp}/psvr2player.log"
+LOG="$HOME/Library/Logs/PSVR2Player.log"
 
 if [[ ! -x "$BIN" ]]; then
 	echo "No built application. Run: make" >&2
@@ -15,10 +16,11 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 : > "$LOG"
-open -a "$APP" --stdout "$LOG" --stderr "$LOG" --args "$@" || exit 1
+open -a "$APP" --args "$@" || exit 1
 
-# Show the log while the application is running
-tail -f "$LOG" &
+# Show the log while the application is running (-F: the player truncates
+# the file on startup)
+tail -F "$LOG" 2>/dev/null &
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null' EXIT INT TERM
 

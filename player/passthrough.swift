@@ -62,9 +62,15 @@ final class PassthroughSource {
 
     var available: Bool { textureL != nil && textureR != nil }
 
+    // Camera USB calls are serialized here. Shutdown joins the read thread
+    // (up to a full transfer timeout) plus a control transfer — on the main
+    // thread that is a visible freeze in the headset, so it runs in the
+    // background; start waits for a still-pending shutdown
+    private let usbQueue = DispatchQueue(label: "psvr2.camera")
+
     func start() -> Bool {
         guard available, !active else { return active }
-        guard psvr2_camera_start() == 0 else {
+        guard usbQueue.sync(execute: { psvr2_camera_start() }) == 0 else {
             print("[passthrough] cameras failed to start")
             return false
         }
@@ -78,8 +84,14 @@ final class PassthroughSource {
         guard active else { return }
         active = false
         gotFrame = false
-        psvr2_camera_stop()
+        usbQueue.async { psvr2_camera_stop() }
         print("[passthrough] cameras off")
+    }
+
+    // Before closing the USB device: the background shutdown must be over
+    func stopAndWait() {
+        stop()
+        usbQueue.sync {}
     }
 
     // Called every render frame

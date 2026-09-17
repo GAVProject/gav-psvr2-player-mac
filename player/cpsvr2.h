@@ -11,7 +11,9 @@ int psvr2_start(void);
 
 void psvr2_stop(void);
 
-/* 1 — the headset is connected and poses are coming in. */
+/* 1 — the headset is connected and poses are coming in. Here and in the pose
+ * getters below a pose older than 0.5 s counts as invalid: the stream is dead
+ * (USB unplugged). */
 int psvr2_connected(void);
 
 /* Last raw SLAM quaternion and position.

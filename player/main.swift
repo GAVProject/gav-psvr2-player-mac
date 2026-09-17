@@ -345,7 +345,10 @@ enum StereoLayout: Int32, CaseIterable {
 struct PlaybackConfig {
     var projection = Projection.equirect180
     var stereo = StereoLayout.sbs
-    var fisheyeFovDeg: Float = 190
+    // Clamped: the shader divides by the FOV
+    var fisheyeFovDeg: Float = 190 {
+        didSet { fisheyeFovDeg = max(60, min(240, fisheyeFovDeg)) }
+    }
     var flipV: Float = 1
     // Stereo depth: horizontal shift of the eye images (fraction of the
     // per-eye frame). Positive pushes the scene away — for videos with
@@ -472,9 +475,11 @@ final class HeadTracker {
 
     func viewRotation() -> float4x4 {
         guard let q = currentOrientation() else {
+            // No pose (not started yet, or the stream went stale): keep the
+            // last view instead of jumping to identity
             connected = false
-            viewQuat = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-            return matrix_identity_float4x4
+            worldAngularVelocity = .zero
+            return float4x4(viewQuat)
         }
         connected = true
 
@@ -527,6 +532,12 @@ final class VideoSource {
     private var textureCache: CVMetalTextureCache?
     private(set) var textureY: MTLTexture?
     private(set) var textureCbCr: MTLTexture?
+    // The CVMetalTexture wrappers (and the pixel buffer) behind the current
+    // textures. They must stay alive until the GPU is done with the frame,
+    // otherwise the buffer returns to the decoder's pool and may be rewritten
+    // while still being sampled — the renderer holds them in its command
+    // buffer completion handler
+    private(set) var frameRefs: [AnyObject] = []
     private(set) var fullRange = false
     private(set) var bt2020 = false
     private(set) var isBGRA = false
@@ -860,9 +871,10 @@ final class VideoSource {
         // Non-planar frame (BGRA) — read as RGB, no YUV conversion needed
         isBGRA = CVPixelBufferGetPlaneCount(pb) == 0
         if isBGRA {
-            if let tex = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm) {
+            if let (tex, ref) = makeTexture(pb, cache: cache, plane: 0, format: .bgra8Unorm) {
                 textureY = tex
                 textureCbCr = tex
+                frameRefs = [pb, ref]
             }
             return
         }
@@ -870,16 +882,17 @@ final class VideoSource {
         let yFormat: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm
         let cbcrFormat: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
 
-        if let y = makeTexture(pb, cache: cache, plane: 0, format: yFormat) {
+        // Both planes or neither: never mix planes of different frames
+        if let (y, yRef) = makeTexture(pb, cache: cache, plane: 0, format: yFormat),
+           let (cbcr, cbcrRef) = makeTexture(pb, cache: cache, plane: 1, format: cbcrFormat) {
             textureY = y
-        }
-        if let cbcr = makeTexture(pb, cache: cache, plane: 1, format: cbcrFormat) {
             textureCbCr = cbcr
+            frameRefs = [pb, yRef, cbcrRef]
         }
     }
 
     private func makeTexture(_ pb: CVPixelBuffer, cache: CVMetalTextureCache,
-                             plane: Int, format: MTLPixelFormat) -> MTLTexture? {
+                             plane: Int, format: MTLPixelFormat) -> (MTLTexture, CVMetalTexture)? {
         let w = CVPixelBufferGetWidthOfPlane(pb, plane)
         let h = CVPixelBufferGetHeightOfPlane(pb, plane)
         var cvTex: CVMetalTexture?
@@ -889,7 +902,8 @@ final class VideoSource {
             print("[video] failed to create texture for plane \(plane): code \(res)")
             return nil
         }
-        return CVMetalTextureGetTexture(cvTex)
+        guard let tex = CVMetalTextureGetTexture(cvTex) else { return nil }
+        return (tex, cvTex)
     }
 
     // No frames — try the next pixel format
@@ -1029,6 +1043,13 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var wornRecenterArmed = false
     private var didWornRecenter = false
     private var reanchorPanel = false
+    // Proximity logic (auto-pause, mouse capture, picker visibility) needs a
+    // live USB session and the headset display. Without them the sensor reads
+    // "not worn" forever: the preview would pause the video and hide the UI
+    var proximityEnabled = true
+    // Tracking-loss notice (USB unplugged mid-run)
+    private var trackingWasOK = false
+    private var trackingLostShown = false
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
@@ -1090,6 +1111,7 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     private func updateProximity() {
+        guard proximityEnabled else { return }
         var prox: Int32 = 0
         var ipd: Int32 = 0
         psvr2_get_status(&prox, &ipd)
@@ -1188,6 +1210,25 @@ final class Renderer: NSObject, MTKViewDelegate {
         }
         let gyroW = scanlineEnabled ? tracker.worldAngularVelocity : .zero
 
+        if tracker.connected != trackingWasOK {
+            trackingWasOK = tracker.connected
+            if tracker.connected {
+                if trackingLostShown {
+                    trackingLostShown = false
+                    overlay?.clearOSD()
+                }
+                print("[usb] tracking: poses are coming in")
+            } else {
+                // Stays until tracking recovers or something else replaces it:
+                // the view is frozen and the user needs to know why. There is
+                // no USB reconnect — an unplugged cable needs a restart
+                trackingLostShown = true
+                overlay?.showOSD("Head tracking lost — check the headset USB cable (restart if it stays)",
+                                 duration: 3600)
+                print("[usb] !!! tracking lost: no SLAM poses (USB unplugged?)")
+            }
+        }
+
         // The panel is fixed in the world; a lone OSD toast is glued to the
         // gaze (panelInv * rot = I). If the panel drifts more than ~70° out
         // of view, move it to the current gaze
@@ -1248,7 +1289,10 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
         cmd.present(drawable)
+        // Video frame buffers must outlive the GPU work that samples them
+        let frameRefs = video?.frameRefs ?? []
         cmd.addCompletedHandler { [weak self] buf in
+            withExtendedLifetime(frameRefs) {}
             guard let self else { return }
             DispatchQueue.main.async {
                 self.statGpuTime += buf.gpuEndTime - buf.gpuStartTime
@@ -1296,11 +1340,7 @@ final class PlayerView: MTKView {
         switch event.keyCode {
         case 12, 53: // Q, Esc
             print("[player] quit")
-            r.overlay?.hide() // restore the system cursor
-            r.video?.savePosition()
-            r.video?.player.pause()
-            psvr2_stop()
-            exit(0)
+            NSApp.terminate(nil) // cleanup lives in applicationWillTerminate
         case 49: // Space
             togglePause()
         case 15: // R
@@ -1556,7 +1596,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // USB tracking
         var calibration = [Float](repeating: 0, count: 8)
-        if psvr2_start() == 0 {
+        let usbOK = psvr2_start() == 0
+        if usbOK {
             print("[usb] PSVR2 connected, SLAM tracking started")
             psvr2_get_distortion_calibration(&calibration)
             print("[usb] Distortion calibration: \(calibration)")
@@ -1590,6 +1631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         renderer = try! Renderer(device: device, config: config, calibration: calibration)
 
         renderer.passthrough = PassthroughSource(device: device)
+        renderer.proximityEnabled = usbOK && vrScreen != nil
 
         // Control panel inside the headset (appears on mouse movement)
         let overlay = UIOverlay(device: device)
@@ -2038,6 +2080,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let link = cvLink {
             CVDisplayLinkStop(link)
         }
+        // Camera shutdown runs in the background — let it finish before the
+        // device is closed
+        renderer?.passthrough?.stopAndWait()
         psvr2_stop()
     }
 }
@@ -2051,10 +2096,14 @@ setbuf(stderr, nil)
 // Watch it: tail -f ~/Library/Logs/PSVR2Player.log or the Console app
 if isatty(STDOUT_FILENO) == 0 {
     let logPath = ("~/Library/Logs/PSVR2Player.log" as NSString).expandingTildeInPath
-    freopen(logPath, "w", stdout)
-    freopen(logPath, "a", stderr)
-    setbuf(stdout, nil)
-    setbuf(stderr, nil)
+    // One descriptor shared by both streams: two separate opens keep separate
+    // offsets, and stdout would overwrite the C core's stderr lines
+    let fd = open(logPath, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0o644)
+    if fd >= 0 {
+        dup2(fd, STDOUT_FILENO)
+        dup2(fd, STDERR_FILENO)
+        close(fd)
+    }
     print("[player] Started \(Date()); log: \(logPath)")
 }
 

@@ -110,12 +110,13 @@ static int g_camera_seq_taken;
 #define IMU_RING_SIZE 256
 #define IMU_DT 0.0005f
 struct imu_sample {
-	uint32_t vts_us;
+	uint32_t vts_us; /* sample time on the VTS timeline, see status_thread_fn */
 	float gyro[3];
 };
 static struct imu_sample g_imu_ring[IMU_RING_SIZE];
 static int g_imu_head; /* index of the next write */
 static int g_imu_count;
+static uint32_t g_imu_last_raw_vts;
 
 /* Quaternions in w,x,y,z order */
 static void quat_mul(const float a[4], const float b[4], float out[4])
@@ -240,8 +241,12 @@ static void *status_thread_fn(void *arg)
 			memcpy(&imu, buf + sizeof(*hdr) + i * sizeof(imu), sizeof(imu));
 
 			/* Axis mapping as in Monado process_imu_record */
+			/* Samples come at exactly 2000 Hz (imu_ts_us steps by 500), but
+			 * vts_us ticks once per millisecond: two consecutive samples
+			 * carry the same value. The second of the pair is 500 us later */
 			struct imu_sample *s = &g_imu_ring[g_imu_head];
-			s->vts_us = imu.vts_us;
+			s->vts_us = imu.vts_us + (imu.vts_us == g_imu_last_raw_vts ? 500 : 0);
+			g_imu_last_raw_vts = imu.vts_us;
 			s->gyro[0] = -DEG_TO_RAD(imu.gyro[1] * GYRO_SCALE);
 			s->gyro[1] = DEG_TO_RAD(imu.gyro[2] * GYRO_SCALE);
 			s->gyro[2] = -DEG_TO_RAD(imu.gyro[0] * GYRO_SCALE);
@@ -534,11 +539,17 @@ int psvr2_get_predicted_quat(float lookahead_s, float out_wxyz[4])
 	for (int n = 0; n < g_imu_count; n++) {
 		struct imu_sample *s = &g_imu_ring[idx];
 		idx = (idx + 1) % IMU_RING_SIZE;
-		if ((int32_t)(s->vts_us - g_slam_vts) <= 0) {
+		/* A sample covers the IMU_DT before its timestamp; the first one
+		 * after the pose only counts from the pose time on. Without this the
+		 * start of the integration snaps to sample boundaries and the
+		 * prediction jitters with every new SLAM pose while the head turns */
+		int32_t since_pose_us = (int32_t)(s->vts_us - g_slam_vts);
+		if (since_pose_us <= 0) {
 			continue;
 		}
+		float dt = since_pose_us < 500 ? (float)since_pose_us * 1e-6f : IMU_DT;
 		float dq[4];
-		quat_from_gyro(s->gyro, IMU_DT, dq);
+		quat_from_gyro(s->gyro, dt, dq);
 		quat_mul(delta, dq, delta);
 	}
 

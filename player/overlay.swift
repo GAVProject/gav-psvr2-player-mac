@@ -733,21 +733,28 @@ final class UIOverlay {
             : String(format: "%d:%02d", s / 60, s % 60)
     }
 
+    // The panel is redrawn on the render thread's time budget (up to 30 times
+    // a second over the timeline): the 2 MB bitmap and its graphics context
+    // are created once
+    private lazy var drawContext: CGContext? = CGContext(
+        data: nil, width: Self.texW, height: Self.texH,
+        bitsPerComponent: 8, bytesPerRow: Self.texW * 4,
+        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue)
+    private lazy var drawGraphicsContext: NSGraphicsContext? =
+        drawContext.map { NSGraphicsContext(cgContext: $0, flipped: false) }
+
     private func redraw() {
         lastRedraw = CACurrentMediaTime()
         lastHovered = hitIndex()
 
-        guard let ctx = CGContext(
-            data: nil, width: Self.texW, height: Self.texH,
-            bitsPerComponent: 8, bytesPerRow: Self.texW * 4,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
+        guard let ctx = drawContext, let graphicsContext = drawGraphicsContext else { return }
 
         ctx.clear(CGRect(x: 0, y: 0, width: Self.texW, height: Self.texH))
 
         NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        NSGraphicsContext.current = graphicsContext
 
         // Panel hidden: draw only the OSD plate on a transparent background
         if !active {

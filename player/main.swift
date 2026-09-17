@@ -392,9 +392,15 @@ final class HeadTracker {
     private let correction = simd_quatf(ix: 0, iy: 0, iz: sqrt(0.5), r: sqrt(0.5))
     var connected = false
     var predictionEnabled = true
-    // Output latency: render + display scanout (adjusted with [ and ]).
-    // The default follows the panel rate — see Renderer.setPanelRate
+    // Pose lookahead = time from the pose sample to the photons. Normally the
+    // renderer measures it per frame from display feedback (frameLookaheadS,
+    // see Renderer.poseLookahead) and [ / ] only add a bias on top. The T key
+    // switches to the old fixed value (extraLookaheadS, then tuned by [ / ]);
+    // its default follows the panel rate — see Renderer.setPanelRate
+    var displayTimedLookahead = true
+    var lookaheadBiasS: Float = 0
     var extraLookaheadS: Float = 0.010
+    var frameLookaheadS: Float = 0.010
 
     // Orientation in x-right, y-up, -z-forward space (Monado axes)
     private func currentOrientation() -> simd_quatf? {
@@ -403,7 +409,7 @@ final class HeadTracker {
         // output latency
         if predictionEnabled {
             var q = [Float](repeating: 0, count: 4)
-            guard psvr2_get_predicted_quat(extraLookaheadS, &q) == 1 else { return nil }
+            guard psvr2_get_predicted_quat(frameLookaheadS, &q) == 1 else { return nil }
             let mapped = simd_quatf(ix: q[1], iy: q[2], iz: q[3], r: q[0])
             return (correction * mapped).normalized
         }
@@ -930,6 +936,39 @@ final class VideoSource {
     }
 }
 
+// MARK: - Frame pacing
+
+// Shared between the CVDisplayLink thread and the main thread
+final class FramePacer {
+    private let lock = NSLock()
+    private var pending = false
+    private var outputHostTime: UInt64 = 0
+    private static let timebase: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) * 1e-9
+    }()
+
+    // Display link thread. true — no draw is queued yet, queue one
+    func vsync(outputHostTime: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        self.outputHostTime = outputHostTime
+        if pending { return false }
+        pending = true
+        return true
+    }
+
+    // Main thread, right before drawing: the time (CACurrentMediaTime scale)
+    // at which the display link expects the frame on screen
+    func takeOutputTime() -> Double {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = false
+        return Double(outputHostTime) * Self.timebase
+    }
+}
+
 // MARK: - Renderer
 
 final class Renderer: NSObject, MTKViewDelegate {
@@ -981,6 +1020,71 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var statFrames = 0
     private var statGpuTime = 0.0
     private var statLastReport = CACurrentMediaTime()
+    // Main-thread cost of a frame, the longest gap between frames (hitches)
+    // and the measured pose-to-scanout latency
+    private var statCpuTime = 0.0
+    private var statCpuMax = 0.0
+    private var statGapMax = 0.0
+    private var statLastDraw = 0.0
+    private var statLatSum = 0.0
+    private var statLatMin = 1e9
+    private var statLatMax = 0.0
+    private var statLatCount = 0
+    private var statOutErrSum = 0.0
+    private var statLookaheadSum = 0.0
+    private var statMissed = 0
+    // When the display link expects the frame being drawn to hit the screen
+    var displayOutputTime = 0.0
+    // Measured: how many refresh periods after that time frames really appear.
+    // 1 is the normal state (a finished frame waits in the layer's queue);
+    // 0 happens while the GPU finishes early enough. 2 means an extra frame
+    // sits in the queue: left alone, that is where the pipeline ends up after
+    // any display-side stall and stays (all drawables in flight, +1 period of
+    // latency for the rest of the session). Dropping one frame drains it.
+    // Measured over 94 s idle: untouched — 2 deep ~85 % of the time; with the
+    // drain below — 1 deep 98 % of the time at the cost of 2 dropped frames.
+    // (Tried and rejected: maximumDrawableCount = 2 — fps falls to ~100;
+    // refusing a second frame within one refresh interval — no gain.)
+    private var presentDelayHistory: [Int] = []
+    private(set) var presentDelayPeriods = 1
+    private var deepQueueFrames = 0
+    private var lastQueueDrain = 0.0
+    private var lastPoseTime = 0.0
+    private var lastPresentedTime = 0.0
+
+    private func notePresentDelay(_ seconds: Double) {
+        let periods = max(0, min(4, Int((seconds * Double(panelHz)).rounded())))
+        presentDelayHistory.append(periods)
+        if presentDelayHistory.count > 15 {
+            presentDelayHistory.removeFirst()
+        }
+        presentDelayPeriods = presentDelayHistory.sorted()[presentDelayHistory.count / 2]
+        deepQueueFrames = periods >= 2 ? deepQueueFrames + 1 : 0
+    }
+
+    var lookaheadDescription: String {
+        if tracker.displayTimedLookahead {
+            return String(format: "measured %.1f ms (bias %+.0f ms)",
+                          poseLookahead(now: lastPoseTime) * 1000, tracker.lookaheadBiasS * 1000)
+        }
+        return String(format: "fixed %.0f ms", tracker.extraLookaheadS * 1000)
+    }
+
+    // Seconds from now to the middle of the scanout of the frame about to be
+    // rendered (the shader's per-row correction is relative to mid-frame)
+    private func poseLookahead(now: Double) -> Float {
+        guard tracker.displayTimedLookahead, displayOutputTime > 0 else {
+            return tracker.extraLookaheadS
+        }
+        let period = 1.0 / Double(panelHz)
+        var present = displayOutputTime + Double(presentDelayPeriods) * period
+        // Drawing late (stalled main thread): that vsync is already lost
+        while present - now < 0.003 {
+            present += period
+        }
+        let lookahead = present - now + Double(scanoutDuration) / 2 + Double(tracker.lookaheadBiasS)
+        return Float(max(0, min(0.08, lookahead)))
+    }
 
     init(device: MTLDevice, config: PlaybackConfig, calibration: [Float]) throws {
         self.device = device
@@ -1157,6 +1261,18 @@ final class Renderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
+        let drawStart = CACurrentMediaTime()
+        if deepQueueFrames >= Int(panelHz), drawStart - lastQueueDrain > 10 {
+            lastQueueDrain = drawStart
+            deepQueueFrames = 0
+            print("[display] present queue is \(presentDelayPeriods) frames deep — dropping one frame to drain it")
+            return
+        }
+        if statLastDraw > 0 {
+            statGapMax = max(statGapMax, drawStart - statLastDraw)
+        }
+        statLastDraw = drawStart
+
         // Fn button on the headset: single press — recenter (horizon kept),
         // double — camera view and back, long (>0.8 s) — video center exactly
         // along the gaze direction
@@ -1197,11 +1313,17 @@ final class Renderer: NSObject, MTKViewDelegate {
         video?.updateTexture()
         passthrough?.update()
 
+        // currentDrawable blocks while all drawables are in flight — the pose
+        // is sampled only after it
         guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
               let cmd = queue.makeCommandBuffer(),
               let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
 
+        let poseTime = CACurrentMediaTime()
+        lastPoseTime = poseTime
+        tracker.frameLookaheadS = poseLookahead(now: poseTime)
+        statLookaheadSum += Double(tracker.frameLookaheadS)
         let rot = tracker.viewRotation()
         // Anchor the panel after recenter is applied (viewQuat is already fresh)
         if reanchorPanel {
@@ -1288,6 +1410,31 @@ final class Renderer: NSObject, MTKViewDelegate {
         enc.setFragmentTexture(passthrough?.textureR ?? placeholderY, index: 4)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         enc.endEncoding()
+        // Ground truth for the pose lookahead: when the frame really hit the
+        // screen, relative to the pose sample and to the display link's estimate
+        let expectedOutput = displayOutputTime
+        drawable.addPresentedHandler { [weak self] d in
+            let presented = d.presentedTime
+            guard presented > 0 else { return } // dropped
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let latency = presented - poseTime
+                self.statLatSum += latency
+                self.statLatMin = min(self.statLatMin, latency)
+                self.statLatMax = max(self.statLatMax, latency)
+                self.statOutErrSum += presented - expectedOutput
+                self.statLatCount += 1
+                // Vsyncs that showed no new frame (what the eye sees as judder)
+                if self.lastPresentedTime > 0 {
+                    let intervals = ((presented - self.lastPresentedTime) * Double(self.panelHz)).rounded()
+                    self.statMissed += max(0, Int(intervals) - 1)
+                }
+                self.lastPresentedTime = presented
+                if expectedOutput > 0 {
+                    self.notePresentDelay(presented - expectedOutput)
+                }
+            }
+        }
         cmd.present(drawable)
         // Video frame buffers must outlive the GPU work that samples them
         let frameRefs = video?.frameRefs ?? []
@@ -1302,12 +1449,36 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         statFrames += 1
         let now = CACurrentMediaTime()
+        statCpuTime += now - drawStart
+        statCpuMax = max(statCpuMax, now - drawStart)
         if now - statLastReport >= 2.0 {
             let fps = Double(statFrames) / (now - statLastReport)
-            let gpuMs = statFrames > 0 ? statGpuTime / Double(statFrames) * 1000 : 0
-            print(String(format: "[stat] fps=%.1f gpu=%.2fms mem=%.0fMB", fps, gpuMs, Self.memoryFootprintMB()))
+            let n = Double(max(statFrames, 1))
+            let lat = Double(max(statLatCount, 1))
+            // cpu: main-thread time per frame avg/max; gap: longest interval
+            // between frames; lat: pose sample -> scanout start avg (min..max);
+            // out: presented time minus the display link's output time;
+            // look: pose lookahead used (to mid-scanout, so ≈ lat + scanout/2);
+            // miss: vsyncs without a new frame (visible judder)
+            print(String(format: "[stat] fps=%.1f gpu=%.2fms cpu=%.2f/%.1fms gap=%.1fms "
+                + "lat=%.1f(%.1f..%.1f)ms out=%+.1fms look=%.1fms miss=%d mem=%.0fMB",
+                fps, statGpuTime / n * 1000, statCpuTime / n * 1000, statCpuMax * 1000,
+                statGapMax * 1000, statLatSum / lat * 1000,
+                (statLatCount > 0 ? statLatMin : 0) * 1000, statLatMax * 1000,
+                statOutErrSum / lat * 1000, statLookaheadSum / n * 1000,
+                statMissed, Self.memoryFootprintMB()))
+            statLookaheadSum = 0
+            statMissed = 0
             statFrames = 0
             statGpuTime = 0
+            statCpuTime = 0
+            statCpuMax = 0
+            statGapMax = 0
+            statLatSum = 0
+            statLatMin = 1e9
+            statLatMax = 0
+            statLatCount = 0
+            statOutErrSum = 0
             statLastReport = now
         }
     }
@@ -1394,12 +1565,19 @@ final class PlayerView: MTKView {
                 layer.displaySyncEnabled.toggle()
                 print("[player] presentation vsync: \(layer.displaySyncEnabled ? "on" : "off")")
             }
-        case 30: // ]
-            r.tracker.extraLookaheadS = min(0.08, r.tracker.extraLookaheadS + 0.005)
-            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
-        case 33: // [
-            r.tracker.extraLookaheadS = max(0, r.tracker.extraLookaheadS - 0.005)
-            print("[player] pose lookahead: \(Int(r.tracker.extraLookaheadS * 1000)) ms")
+        case 30, 33: // ] and [ — lookahead: bias over the measured value, or the fixed value
+            let step: Float = event.keyCode == 30 ? 0.002 : -0.002
+            if r.tracker.displayTimedLookahead {
+                r.tracker.lookaheadBiasS = max(-0.03, min(0.03, r.tracker.lookaheadBiasS + step))
+            } else {
+                r.tracker.extraLookaheadS = max(0, min(0.08, r.tracker.extraLookaheadS + step))
+            }
+            r.overlay?.showOSD("Lookahead: \(r.lookaheadDescription)")
+            print("[player] pose lookahead: \(r.lookaheadDescription)")
+        case 17: // T — lookahead timing: measured from display feedback / fixed
+            r.tracker.displayTimedLookahead.toggle()
+            r.overlay?.showOSD("Lookahead: \(r.lookaheadDescription)")
+            print("[player] pose lookahead: \(r.lookaheadDescription)")
         case 24, 69: // + (=)
             changeFov(by: 5)
         case 27, 78: // -
@@ -1749,9 +1927,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var linkOut: CVDisplayLink?
         CVDisplayLinkCreateWithCGDisplay(displayID, &linkOut)
         if let link = linkOut {
-            CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, _, _, _ in
+            let pacer = FramePacer()
+            CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, inOutputTime, _, _ in
+                // A stalled main thread must not get a burst of queued draws
+                // afterwards: one pending draw at a time, and it uses the
+                // newest output time
+                let first = pacer.vsync(outputHostTime: inOutputTime.pointee.hostTime)
+                guard first else { return kCVReturnSuccess }
                 DispatchQueue.main.async {
-                    self?.playerView?.draw()
+                    guard let self else { return }
+                    self.renderer.displayOutputTime = pacer.takeOutputTime()
+                    self.playerView?.draw()
                 }
                 return kCVReturnSuccess
             }
@@ -1769,7 +1955,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         print("[player] Controls: Space pause · R or headset Fn button — recenter · F projection · G stereo · V flip")
         print("[player]           ←/→ ±15s · ↑/↓ volume · +/- fisheye FOV · Q quit")
-        print("[player]           debug: P prediction · [/] lookahead · S scanout · C chromatic")
+        print("[player]           debug: P prediction · [/] lookahead · T lookahead mode · S scanout · C chromatic")
     }
 
     private static func fixUpCalibration(_ calibration: inout [Float]) {
@@ -1893,7 +2079,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addHeader("Headset and tracking")
         addRow("Tracking", id: "track", key: "")
         addRow("Pose prediction", id: "pred", key: "P")
-        addRow("Lookahead", id: "look", key: "[ / ]")
+        addRow("Lookahead", id: "look", key: "[ / ] · T")
         addRow("Scanout correction", id: "scan", key: "S")
         addRow("Chromatic", id: "chrom", key: "C")
         addRow("Vsync", id: "vsync", key: "D")
@@ -1980,7 +2166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         set("track", r.tracker.connected ? "yes" : "NO")
         set("pred", r.tracker.predictionEnabled ? "on" : "off")
-        set("look", "\(Int(r.tracker.extraLookaheadS * 1000)) ms")
+        set("look", r.lookaheadDescription)
         set("scan", r.scanlineEnabled ? "on" : "off")
         set("chrom", r.chromaticEnabled ? "on" : "off")
         set("vsync", ((playerView?.layer as? CAMetalLayer)?.displaySyncEnabled ?? true)

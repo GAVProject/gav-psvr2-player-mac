@@ -119,7 +119,7 @@ an uncomfortably close scene away; separate from camera convergence) ·
 Mouse: move — panel · click — select · right-drag — tilt scene ·
 wheel — scroll list. Trackpad: two-finger scroll — list, two-finger
 press-drag — tilt scene.
-Debug: `P` pose prediction · `[`/`]` look-ahead · `S` scanline correction ·
+Debug: `P` pose prediction · `[`/`]` look-ahead bias · `T` measured/fixed look-ahead · `S` scanline correction ·
 `C` chromatic correction · `D` vsync.
 
 ## Layout

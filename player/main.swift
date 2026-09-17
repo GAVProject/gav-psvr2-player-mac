@@ -5,7 +5,8 @@
 // lens distortion is corrected using the calibration of the specific headset unit.
 //
 // Keys: Space — pause, R — recenter, F — projection, G — stereo layout,
-// V — vertical flip, arrows — seek, +/- — fisheye FOV, Q — quit.
+// V — vertical flip, arrows — seek / volume, 9/0 — brightness,
+// +/- — fisheye FOV, Q — quit.
 
 import AppKit
 import AVFoundation
@@ -342,7 +343,7 @@ enum StereoLayout: Int32, CaseIterable {
     }
 }
 
-struct PlaybackConfig {
+struct PlaybackConfig: Equatable {
     var projection = Projection.equirect180
     var stereo = StereoLayout.sbs
     // Clamped: the shader divides by the FOV
@@ -353,34 +354,115 @@ struct PlaybackConfig {
     // Stereo depth: horizontal shift of the eye images (fraction of the
     // per-eye frame). Positive pushes the scene away — for videos with
     // uncomfortably close shots. Separate from the passthrough convergence;
-    // resets to 0 for every opened file
+    // 0 for a new file, remembered per file like the rest (FormatStore)
     var depth: Float = 0
 
-    // Guess the format from the file name
-    static func detect(from name: String) -> PlaybackConfig {
-        var cfg = PlaybackConfig()
-        let n = name.uppercased()
+    // Result of the automatic guess. The flags tell which parts the file name
+    // actually named: the rest are defaults that container metadata may
+    // override once the track is loaded
+    struct Detection {
+        var config = PlaybackConfig()
+        var projectionFromName = false
+        var stereoFromName = false
 
-        if n.contains("FISHEYE") || n.contains("VR180FISH") {
-            cfg.projection = .fisheye
-            if let range = n.range(of: #"FISHEYE(\d{3})"#, options: .regularExpression) {
-                let digits = n[range].dropFirst("FISHEYE".count)
-                if let fov = Float(digits) { cfg.fisheyeFovDeg = fov }
+        // Container metadata (ProjectionKind / ViewPackingKind format
+        // description extensions, MV-HEVC eye views) fills in what the file
+        // name left open. Returns true if the config changed
+        mutating func apply(projectionKind: String?, viewPacking: String?, multiview: Bool) -> Bool {
+            let before = config
+            if !projectionFromName {
+                switch projectionKind {
+                case "Equirectangular": config.projection = .equirect360
+                case "HalfEquirectangular": config.projection = .equirect180
+                default: break // rectilinear / unknown: keep the guess
+                }
             }
-        } else if n.contains("360") {
-            cfg.projection = .equirect360
-        } else if n.contains("180") {
-            cfg.projection = .equirect180
+            if !stereoFromName {
+                switch viewPacking {
+                case "SideBySide": config.stereo = .sbs
+                case "OverUnder": config.stereo = .tb
+                default:
+                    // MV-HEVC keeps the eyes in separate layers and the
+                    // decoder delivers only the base one: a single-eye frame.
+                    // An unpacked full sphere is mono as well
+                    if multiview || projectionKind == "Equirectangular" {
+                        config.stereo = .mono
+                    }
+                }
+            }
+            return config != before
+        }
+    }
+
+    // Fisheye lens names used by DeoVR-style file names → FOV in degrees
+    private static let fisheyeLenses: [String: Float] = [
+        "MKX200": 200, "MKX220": 220, "VRCA220": 220, "RF52": 190,
+    ]
+
+    // Guess the format from the file name. Short tags (_LR, _TB, _3DH…) are
+    // matched as whole tokens between separators, and 180/360 must not be
+    // part of a longer number (3600x1800, 1360…)
+    static func detect(from name: String) -> Detection {
+        var d = Detection()
+        let n = (name as NSString).deletingPathExtension.uppercased()
+        let tokens = Set(n.components(separatedBy: CharacterSet.alphanumerics.inverted))
+        func standalone(_ number: String) -> Bool {
+            n.range(of: "(?<![0-9])\(number)(?![0-9P])", options: .regularExpression) != nil
         }
 
-        if n.contains("_TB") || n.contains("OVERUNDER") || n.contains("_OU") || n.contains("TOPBOTTOM") {
-            cfg.stereo = .tb
-        } else if n.contains("SBS") || n.contains("_LR") || n.contains("SIDEBYSIDE") || n.contains("180") || n.contains("FISHEYE") {
-            cfg.stereo = .sbs
-        } else if cfg.projection == .equirect360 {
-            cfg.stereo = .mono
+        if let lens = fisheyeLenses.first(where: { tokens.contains($0.key) }) {
+            d.config.projection = .fisheye
+            d.config.fisheyeFovDeg = lens.value
+            d.projectionFromName = true
+        } else if n.contains("FISHEYE") || n.contains("VR180FISH") {
+            d.config.projection = .fisheye
+            if let range = n.range(of: #"FISHEYE\d{3}(?![0-9])"#, options: .regularExpression),
+               let fov = Float(n[range].dropFirst("FISHEYE".count)) {
+                d.config.fisheyeFovDeg = fov
+            }
+            d.projectionFromName = true
+        } else if standalone("360") {
+            d.config.projection = .equirect360
+            d.projectionFromName = true
+        } else if standalone("180") {
+            d.config.projection = .equirect180
+            d.projectionFromName = true
         }
-        return cfg
+
+        let hasToken = { (list: [String]) in list.contains(where: tokens.contains) }
+        if hasToken(["TB", "OU", "3DV"]) || n.contains("OVERUNDER") || n.contains("TOPBOTTOM") {
+            d.config.stereo = .tb
+            d.stereoFromName = true
+        } else if hasToken(["LR", "3DH"]) || n.contains("SBS") || n.contains("SIDEBYSIDE") {
+            d.config.stereo = .sbs
+            d.stereoFromName = true
+        } else if hasToken(["MONO"]) {
+            d.config.stereo = .mono
+            d.stereoFromName = true
+        } else if d.config.projection == .equirect360 {
+            // An untagged full sphere is almost always mono; untagged 180 and
+            // fisheye are almost always SBS (the default)
+            d.config.stereo = .mono
+        }
+        return d
+    }
+}
+
+// Headset panel brightness (0.1…1), remembered between launches. The command
+// is a USB control transfer, so it goes through the control queue
+enum HeadsetBrightness {
+    private static let key = "brightness"
+
+    static var value: Float {
+        let saved = UserDefaults.standard.object(forKey: key) as? Float ?? 1
+        return max(0.1, min(1, saved))
+    }
+
+    static func change(by delta: Float) -> Float {
+        let v = max(0.1, min(1, ((value + delta) * 10).rounded() / 10))
+        UserDefaults.standard.set(v, forKey: key)
+        psvr2ControlQueue.async { _ = psvr2_set_brightness(v) }
+        return v
     }
 }
 
@@ -551,6 +633,9 @@ final class VideoSource {
     private var endObserver: NSObjectProtocol?
     let url: URL
     var onUnsupported: ((String) -> Void)?
+    // Format hints found in the track: ProjectionKind, ViewPackingKind,
+    // MV-HEVC stereo pair (called on main, only when there is any)
+    var onFormatMetadata: ((String?, String?, Bool) -> Void)?
     private var loggedFormat = false
     private var noFrameSince = CACurrentMediaTime()
     private var gotAnyFrame = false
@@ -668,8 +753,21 @@ final class VideoSource {
                     if exts.keys.contains(where: { $0.contains("Heroes") || $0.contains("MVHEVC") }) {
                         extra += ", MV-HEVC"
                     }
-                    if let tags = exts["\(kCMFormatDescriptionExtension_ProjectionKind)"] {
-                        extra += ", projection \(tags)"
+                    // Literal keys: the constants need macOS 14/15
+                    let projectionKind = exts["ProjectionKind"] as? String
+                    let viewPacking = exts["ViewPackingKind"] as? String
+                    let multiview = exts["HasLeftStereoEyeView"] as? Bool == true
+                        && exts["HasRightStereoEyeView"] as? Bool == true
+                    if let projectionKind {
+                        extra += ", projection \(projectionKind)"
+                    }
+                    if let viewPacking {
+                        extra += ", packing \(viewPacking)"
+                    }
+                    if projectionKind != nil || viewPacking != nil || multiview {
+                        await MainActor.run {
+                            self.onFormatMetadata?(projectionKind, viewPacking, multiview)
+                        }
                     }
                 }
                 extra += ", layers: \(formats.count)"
@@ -984,7 +1082,16 @@ final class Renderer: NSObject, MTKViewDelegate {
     private var envTexture: MTLTexture?
     let tracker = HeadTracker()
     var video: VideoSource?
-    var config: PlaybackConfig
+    // Every change made while a file is open (keys, Format menu) is a manual
+    // choice: remembered per file unless it matches the automatic guess
+    var config: PlaybackConfig {
+        didSet {
+            guard config != oldValue, let url = video?.url else { return }
+            FormatStore.set(config == detection.config ? nil : config, for: url)
+        }
+    }
+    // What the file name and container metadata suggest for the open file
+    var detection = PlaybackConfig.Detection()
     var calibration: [Float]
     var chromaticEnabled = true
     var scanlineEnabled = true
@@ -1578,6 +1685,10 @@ final class PlayerView: MTKView {
             r.tracker.displayTimedLookahead.toggle()
             r.overlay?.showOSD("Lookahead: \(r.lookaheadDescription)")
             print("[player] pose lookahead: \(r.lookaheadDescription)")
+        case 25, 29: // 9 and 0 — headset display brightness
+            let value = HeadsetBrightness.change(by: event.keyCode == 29 ? 0.1 : -0.1)
+            r.overlay?.showOSD("Brightness \(Int((value * 100).rounded()))%")
+            print("[player] display brightness: \(Int((value * 100).rounded()))%")
         case 24, 69: // + (=)
             changeFov(by: 5)
         case 27, 78: // -
@@ -1611,8 +1722,11 @@ final class PlayerView: MTKView {
         if let current = video.deviceVolume() {
             let target = max(0, min(1, current + delta))
             if video.setDeviceVolume(target) {
+                // The system remembers a device's own volume — nothing to save
                 video.player.volume = 1
-                print("[player] headset volume (hardware): \(Int(target * 100))%")
+                let percent = Int((target * 100).rounded())
+                renderer?.overlay?.showOSD("Volume \(percent)%")
+                print("[player] headset volume (hardware): \(percent)%")
                 return
             }
         }
@@ -1625,10 +1739,33 @@ final class PlayerView: MTKView {
         print("[player] player volume: \(percent)%")
     }
 
+    // Target of the seek in flight. currentTime() does not move until a seek
+    // lands (slow on 8K), so a burst of key presses has to add up from the
+    // previous target, not from the stale position
+    private var pendingSeek: (player: AVPlayer, target: CMTime)?
+    private var seekGeneration = 0
+
     private func seek(by seconds: Double) {
         guard let p = renderer?.video?.player else { return }
-        let target = CMTimeAdd(p.currentTime(), CMTime(seconds: seconds, preferredTimescale: 600))
-        p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+        let base = pendingSeek.flatMap { $0.player === p ? $0.target : nil } ?? p.currentTime()
+        var t = base.seconds + seconds
+        if let item = p.currentItem, item.duration.isNumeric {
+            t = min(t, item.duration.seconds)
+        }
+        seek(p, to: CMTime(seconds: max(0, t), preferredTimescale: 600))
+    }
+
+    private func seek(_ p: AVPlayer, to target: CMTime) {
+        pendingSeek = (p, target)
+        seekGeneration += 1
+        let generation = seekGeneration
+        p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity) { [weak self] _ in
+            DispatchQueue.main.async {
+                // A newer seek cancels this one — its target stays in charge
+                guard let self, self.seekGeneration == generation else { return }
+                self.pendingSeek = nil
+            }
+        }
     }
 
     private func togglePause() {
@@ -1720,8 +1857,7 @@ final class PlayerView: MTKView {
         case .seekFraction(let f):
             guard let p = r.video?.player, let item = p.currentItem,
                   item.duration.isNumeric else { break }
-            let target = CMTime(seconds: item.duration.seconds * f, preferredTimescale: 600)
-            p.seek(to: target, toleranceBefore: .zero, toleranceAfter: .positiveInfinity)
+            seek(p, to: CMTime(seconds: item.duration.seconds * f, preferredTimescale: 600))
             print("[player] seek to \(Int(item.duration.seconds * f)) s")
         }
     }
@@ -1767,10 +1903,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var sweeper: WindowSweeper?
     var usbTimer: Timer?
     private var usbRestarting = false
-    let videoURL: URL?
+    // File to open at launch: command-line argument, or a Finder/Dock open
+    // that started the app
+    private var videoURL: URL?
 
     init(videoURL: URL?) {
         self.videoURL = videoURL
+    }
+
+    // "Open With", a drop on the Dock icon, `open -a PSVR2Player file`
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first else { return }
+        guard let renderer else {
+            // Still launching: applicationDidFinishLaunching picks it up
+            videoURL = url
+            return
+        }
+        // AppKit also reports the command-line argument this way
+        guard url.standardizedFileURL != renderer.video?.url.standardizedFileURL else { return }
+        print("[player] open request: \(url.path)")
+        loadVideo(url)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1781,7 +1933,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("[usb] PSVR2 connected, SLAM tracking started")
             psvr2_get_distortion_calibration(&calibration)
             print("[usb] Distortion calibration: \(calibration)")
-            psvr2_set_brightness(1.0)
+            psvr2_set_brightness(HeadsetBrightness.value)
         } else {
             print("[usb] !!! Headset not found on USB — rendering without tracking")
             calibration = [-0.09919293, 0, 0.09919293, 0, 1, 0, 1, 0]
@@ -1799,12 +1951,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let device = MTLCreateSystemDefaultDevice()!
 
-        var config = PlaybackConfig()
-        if let url = videoURL {
-            config = PlaybackConfig.detect(from: url.lastPathComponent)
-        }
-
-        renderer = try! Renderer(device: device, config: config, calibration: calibration)
+        // loadVideo sets the real format
+        renderer = try! Renderer(device: device, config: PlaybackConfig(), calibration: calibration)
 
         renderer.passthrough = PassthroughSource(device: device)
         renderer.proximityEnabled = usbOK && vrScreen != nil
@@ -1954,7 +2102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         print("[player] Controls: Space pause · R or headset Fn button — recenter · F projection · G stereo · V flip")
-        print("[player]           ←/→ ±15s · ↑/↓ volume · +/- fisheye FOV · Q quit")
+        print("[player]           ←/→ ±15s · ↑/↓ volume · 9/0 brightness · +/- fisheye FOV · Q quit")
         print("[player]           debug: P prediction · [/] lookahead · T lookahead mode · S scanout · C chromatic")
     }
 
@@ -1983,7 +2131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var calibration = [Float](repeating: 0, count: 8)
             let haveCalibration = ok && psvr2_get_distortion_calibration(&calibration) == 0
             if ok {
-                psvr2_set_brightness(1.0)
+                psvr2_set_brightness(HeadsetBrightness.value)
             }
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -2006,7 +2154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let deskScreen = NSScreen.screens.first {
             !$0.localizedName.localizedCaseInsensitiveContains("PS VR2")
         } ?? NSScreen.main!
-        let size = NSSize(width: 620, height: 578)
+        let size = NSSize(width: 620, height: 600)
         let frame = NSRect(
             x: deskScreen.visibleFrame.maxX - size.width - 24,
             y: deskScreen.visibleFrame.minY + 24,
@@ -2077,6 +2225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addRow("Convergence", id: "ptconv", key: ", / .")
         addRow("Lens angle", id: "ptfov", key: "+ / −")
         addHeader("Headset and tracking")
+        addRow("Brightness", id: "bright", key: "9 / 0")
         addRow("Tracking", id: "track", key: "")
         addRow("Pose prediction", id: "pred", key: "P")
         addRow("Lookahead", id: "look", key: "[ / ] · T")
@@ -2156,6 +2305,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         set("flip", cfg.flipV < 0 ? "on" : "off")
         set("depth", cfg.depth == 0 ? "0 (default)" : String(format: "%+.3f", cfg.depth))
         set("fov", String(format: "%.0f°", cfg.fisheyeFovDeg))
+
+        set("bright", "\(Int((HeadsetBrightness.value * 100).rounded()))%")
 
         if let pt = r.passthrough {
             set("pt", pt.active ? "on" : (pt.available ? "off" : "unavailable"))
@@ -2282,7 +2433,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         renderer.video = vs
         renderer.overlay?.setCurrentFile(url)
-        renderer.config = PlaybackConfig.detect(from: url.lastPathComponent)
+        // A format picked by hand earlier beats the automatic guess
+        renderer.detection = PlaybackConfig.detect(from: url.lastPathComponent)
+        let remembered = FormatStore.config(for: url)
+        renderer.config = remembered ?? renderer.detection.config
+        // Track metadata arrives later and fills in what the name left open
+        vs.onFormatMetadata = { [weak renderer, weak vs] projectionKind, viewPacking, multiview in
+            guard let renderer, let vs, renderer.video === vs else { return }
+            let manual = renderer.config != renderer.detection.config
+            guard renderer.detection.apply(
+                projectionKind: projectionKind, viewPacking: viewPacking, multiview: multiview),
+                !manual else { return }
+            renderer.config = renderer.detection.config
+            print("[player] Format from track metadata: \(renderer.config.projection.label), "
+                + "\(renderer.config.stereo.label)")
+        }
         renderer.playbackRate = 1.0 // rate is situational; a new file starts at 1×
 
         // Resume from the last position if the file was watched before
@@ -2301,7 +2466,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let config = renderer.config
         print("[player] File: \(url.lastPathComponent)")
         print("[player] Projection: \(config.projection.label), \(config.stereo.label)"
-            + (config.projection == .fisheye ? ", FOV \(config.fisheyeFovDeg)°" : ""))
+            + (config.projection == .fisheye ? ", FOV \(config.fisheyeFovDeg)°" : "")
+            + (remembered != nil ? " (remembered manual choice)" : ""))
     }
 
     func applicationWillTerminate(_ notification: Notification) {

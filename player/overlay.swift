@@ -247,6 +247,13 @@ final class UIOverlay {
     // File opened from a command-line argument
     func setCurrentFile(_ url: URL) {
         currentFile = url
+        // Opened from outside (Finder, Dock) while the file list was showing
+        if mode == .picker {
+            mode = .controls
+            buildControlButtons()
+            metaCache.cancelPending()
+            redrawSoon()
+        }
     }
 
     func openPicker(startDir: URL? = nil) {

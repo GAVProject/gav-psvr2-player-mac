@@ -21,6 +21,24 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 
+	<!-- "Open With" and drops on the Dock icon (application(_:open:)).
+	     Alternate rank: never take over as the default video player -->
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Video</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.movie</string>
+			</array>
+		</dict>
+	</array>
+
 	<!-- Without these strings macOS cannot show the access prompt
 	     and accessing the volume simply hangs -->
 	<key>NSRemovableVolumesUsageDescription</key>

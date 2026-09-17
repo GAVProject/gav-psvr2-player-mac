@@ -29,7 +29,9 @@ brick) bridges that gap. No software can work around it.
   (2000 Hz) with extrapolation — honest 120 fps with no ghosting
 - Per-scanline rolling-shutter compensation driven by the gyro
 - Projections: equirect 360°, half-equirect 180°, fisheye (adjustable FOV);
-  SBS / top-bottom / mono stereo; auto-detected from the file name
+  SBS / top-bottom / mono stereo; auto-detected from the file name (`_180`,
+  `_360`, `_SBS`/`_LR`/`_3DH`, `_TB`/`_OU`/`_3DV`, `_MONO`, `FISHEYE190`,
+  `MKX200`…) and track metadata; a format you pick by hand is remembered per file
 - Hardware video decoding (AVFoundation) — 8K HEVC is not a problem;
   playback speed 0.5–2× with pitch-corrected audio
 - Audio routes to the headset's headphones automatically. Recenter with the
@@ -95,7 +97,8 @@ player/play        # or ./play from the player/ directory
 This is the normal way to use the player: it starts with the file picker
 right in the headset — browse folders (thumbnails, durations, resume
 positions) and click a video with the virtual cursor. You can also launch
-`player/PSVR2Player.app` from Finder/Dock instead.
+`player/PSVR2Player.app` from Finder/Dock instead, or drop a video on its Dock
+icon / use "Open With".
 
 To open a specific file right away, pass it as an argument:
 
@@ -114,7 +117,7 @@ centers the video on your gaze, handy when lying down; double-press — camera
 view) · `B` camera view (`M` stereo/mono, `,`/`.` convergence) ·
 `F` projection · `G` stereo · `V` vertical flip · `,`/`.` stereo depth (pushes
 an uncomfortably close scene away; separate from camera convergence) ·
-`←/→` ±15 s · `↑/↓` volume ·
+`←/→` ±15 s · `↑/↓` volume · `9`/`0` headset brightness ·
 `+/-` fisheye FOV or camera lens angle · `Q` quit.
 Mouse: move — panel · click — select · right-drag — tilt scene ·
 wheel — scroll list. Trackpad: two-finger scroll — list, two-finger

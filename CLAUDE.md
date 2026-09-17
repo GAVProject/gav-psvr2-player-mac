@@ -61,8 +61,11 @@ One fullscreen-triangle pass. The Metal shader is an inline string (`shaderSourc
 - GPU profile of the fragment shader (6.0 ms): three chromatic passes are the multiplier (1 channel = 2.7 ms), projection trig ≈ 1.8 ms, the distortion LUT only ≈ 0.3 ms, texture sampling ≈ 0 — precomputing the distortion is not worth it.
 - `Renderer.setPanelRate` derives scanout duration and the fixed-mode lookahead (~1.2 frames) from the active 90/120 Hz display mode and re-runs on screen-parameter changes.
 - `HeadTracker` composes `offsetCurrent * recenter * q`: recenter removes yaw only (keeps the horizon); the manual scene tilt is pitch-only on purpose (manual yaw + pitch produces roll) with a slerp follower. Long Fn press = full recenter including pitch (for lying down).
+- Files arrive three ways: command-line argument, the in-headset picker, and `application(_:open:)` (Finder "Open With", Dock drop, `open -a`; `CFBundleDocumentTypes` = `public.movie`, rank Alternate). AppKit may call it before `applicationDidFinishLaunching` — then it only sets `videoURL`.
+- `PlayerView.seek(by:)` adds up from the target of the seek still in flight (`pendingSeek`), because `currentTime()` doesn't move until a seek lands.
 - `Renderer.draw` also hosts the per-frame state machines: Fn button (single / double / long press), debounced proximity sensor → auto-pause/resume, mouse capture and first-wear recenter.
-- `PlaybackConfig.detect(from:)` guesses projection and stereo layout from the file name.
+- `PlaybackConfig.detect(from:)` guesses projection and stereo layout from the file name (whole-token tags incl. DeoVR's `_3DH`/`_3DV`/`MKX200`…; `180`/`360` only when not part of a longer number) and returns a `Detection` whose flags say what the name really named; `Detection.apply` lets track metadata (`ProjectionKind`, `ViewPackingKind`, MV-HEVC = mono because only the base layer is decoded) fill in the rest when `describeTracks` finishes. Both are pure functions.
+- `Renderer.config.didSet` is the single place that remembers a manual format: any change while a file is open is saved to `FormatStore` (per path) unless it equals `renderer.detection.config`. So set `detection` *before* `config` when loading, and don't mutate `config` for non-user reasons while a video is open.
 - Audio is routed to the headset's USB audio output via CoreAudio; input-only PS VR2 audio devices must be skipped (selecting one makes playback never advance). The device has no volume control, so volume is the player's own 0–100 %.
 
 ### Windows and input
@@ -70,7 +73,7 @@ One fullscreen-triangle pass. The Metal shader is an inline string (`shaderSourc
 - The headset window is borderless, above the menu bar, and intentionally never becomes key. Keyboard focus lives in the remote/status window on the regular monitor so system permission dialogs open where the user can see them; keys reach `PlayerView` through a local `NSEvent` monitor.
 - `WindowSweeper` (`sweeper.swift`) uses the Accessibility API to move stray windows off the headset display.
 - `UIOverlay` (`overlay.swift`) draws the control panel / file picker / Format submenu with CoreGraphics into a 1024×512 texture; the shader places it as a world-anchored quad and draws the virtual cursor. While the headset is worn the real mouse is captured (warped onto the headset screen and disassociated) and only deltas move the virtual cursor; taking the headset off releases it. The cursor-reachable margin constants (`marginU`/`marginV`) are duplicated in the shader. Button presses return `UIAction`s that `PlayerView.perform(uiAction:)` executes — the same path the keyboard uses.
-- `meta.swift`: `VideoMetaCache` (background thumbnails/duration/resolution for the picker) and `ResumeStore` (per-file resume position). Persistent state is in `UserDefaults`: `volume`, `lastDir`, `lastFile`, resume positions.
+- `meta.swift`: `VideoMetaCache` (background thumbnails/duration/resolution for the picker) and `ResumeStore` (per-file resume position). `FormatStore` (per-file manual format). Persistent state is in `UserDefaults`: `volume`, `brightness`, `lastDir`, `lastFile`, `resumePositions`, `fileFormats` (test-seeding these with `defaults write` needs `<real>` values — plain numbers become strings and are ignored).
 
 ### Known physical limit
 

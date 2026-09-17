@@ -3,6 +3,7 @@
 // noticeable time to decode); results are cached for the session.
 //
 // ResumeStore — per-file playback position memory (UserDefaults).
+// FormatStore — per-file memory of a manually chosen format.
 
 import AVFoundation
 
@@ -96,6 +97,48 @@ enum ResumeStore {
     // nil — remove the entry (file watched to the end)
     static func set(_ pos: Double?, for url: URL) {
         cache[url.path] = pos
+        UserDefaults.standard.set(cache, forKey: key)
+    }
+}
+
+// MARK: - Manual format memory
+
+// The format the user picked by hand for a file (projection, stereo layout,
+// fisheye FOV, flip, depth). Takes priority over PlaybackConfig.detect the
+// next time the file is opened
+enum FormatStore {
+    private static let key = "fileFormats"
+
+    private static var cache: [String: [String: Double]] =
+        (UserDefaults.standard.dictionary(forKey: key) as? [String: [String: Double]]) ?? [:]
+
+    static func config(for url: URL) -> PlaybackConfig? {
+        guard let e = cache[url.path],
+              let projection = e["projection"].flatMap({ Projection(rawValue: Int32($0)) }),
+              let stereo = e["stereo"].flatMap({ StereoLayout(rawValue: Int32($0)) }) else { return nil }
+        var cfg = PlaybackConfig()
+        cfg.projection = projection
+        cfg.stereo = stereo
+        cfg.fisheyeFovDeg = Float(e["fov"] ?? 190)
+        cfg.flipV = (e["flip"] ?? 1) < 0 ? -1 : 1
+        cfg.depth = Float(max(-0.1, min(0.1, e["depth"] ?? 0)))
+        return cfg
+    }
+
+    // nil — forget the entry (the format is back to what detection gives)
+    static func set(_ cfg: PlaybackConfig?, for url: URL) {
+        if let cfg {
+            let entry: [String: Double] = [
+                "projection": Double(cfg.projection.rawValue),
+                "stereo": Double(cfg.stereo.rawValue),
+                "fov": Double(cfg.fisheyeFovDeg),
+                "flip": Double(cfg.flipV),
+                "depth": Double(cfg.depth),
+            ]
+            cache[url.path] = entry
+        } else {
+            cache[url.path] = nil
+        }
         UserDefaults.standard.set(cache, forKey: key)
     }
 }

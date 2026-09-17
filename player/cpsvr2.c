@@ -77,6 +77,15 @@ static libusb_device_handle *g_dev;
 static pthread_t g_slam_thread, g_status_thread;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_running;
+/* A read thread exited on a USB error (cable unplugged): the session is dead
+ * and needs psvr2_restart() */
+static volatile int g_link_lost;
+/* Restart attempts repeat every couple of seconds — don't log each miss */
+static int g_quiet_start;
+/* Consecutive starts where the device was there but the interfaces could not
+ * be set up (seen after a cable replug) */
+static int g_claim_failures;
+static volatile int g_reset_in_flight;
 static int g_have_pose;
 static float g_quat[4];
 static float g_pos[3];
@@ -169,6 +178,7 @@ static void *slam_thread_fn(void *arg)
 		if (ret != 0) {
 			if (g_running) {
 				fprintf(stderr, "psvr2: slam read error: %s\n", libusb_error_name(ret));
+				g_link_lost = 1;
 			}
 			break;
 		}
@@ -210,6 +220,7 @@ static void *status_thread_fn(void *arg)
 		if (ret != 0) {
 			if (g_running) {
 				fprintf(stderr, "psvr2: status read error: %s\n", libusb_error_name(ret));
+				g_link_lost = 1;
 			}
 			break;
 		}
@@ -280,6 +291,46 @@ static int send_control(uint16_t report_id, uint8_t subcmd, const uint8_t *data,
 	return ret < 0 ? ret : 0;
 }
 
+/* After a cable replug the device sometimes comes up in a state where macOS
+ * can't find the status interface's alt setting (SetAlternateInterface ->
+ * kIOReturnNotFound). Retrying never cures it; a re-enumeration does. libusb
+ * waits up to 10 s inside libusb_reset_device, so the reset gets its own
+ * thread, context and handle — start attempts go on meanwhile and succeed as
+ * soon as the device is back. */
+static void *reset_thread_fn(void *arg)
+{
+	(void)arg;
+	libusb_context *ctx = NULL;
+	if (libusb_init(&ctx) == 0) {
+		libusb_device_handle *dev = libusb_open_device_with_vid_pid(ctx, PSVR2_VID, PSVR2_PID);
+		if (dev != NULL) {
+			int ret = libusb_reset_device(dev);
+			/* A timeout is the usual outcome: the device re-enumerates as a
+			 * new one and this handle never sees it come back */
+			fprintf(stderr, "psvr2: device reset finished: %s\n", libusb_error_name(ret));
+			libusb_close(dev);
+		}
+		libusb_exit(ctx);
+	}
+	g_reset_in_flight = 0;
+	return NULL;
+}
+
+static void request_device_reset(void)
+{
+	if (g_reset_in_flight) {
+		return;
+	}
+	g_reset_in_flight = 1;
+	fprintf(stderr, "psvr2: requesting a device re-enumeration\n");
+	pthread_t thread;
+	if (pthread_create(&thread, NULL, reset_thread_fn, NULL) == 0) {
+		pthread_detach(thread);
+	} else {
+		g_reset_in_flight = 0;
+	}
+}
+
 int psvr2_set_brightness(float brightness)
 {
 	if (g_dev == NULL) {
@@ -339,32 +390,59 @@ int psvr2_start(void)
 		fprintf(stderr, "psvr2: libusb_init: %s\n", libusb_error_name(ret));
 		return -1;
 	}
+	/* The previous attempt failed at claiming: let libusb itself say why (the
+	 * IOKit error behind LIBUSB_ERROR_OTHER). Only a few times — it's verbose */
+	if (g_claim_failures >= 1 && g_claim_failures <= 3) {
+		libusb_set_option(g_ctx, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_INFO);
+	}
 
 	g_dev = libusb_open_device_with_vid_pid(g_ctx, PSVR2_VID, PSVR2_PID);
 	if (g_dev == NULL) {
-		fprintf(stderr, "psvr2: device %04x:%04x not found\n", PSVR2_VID, PSVR2_PID);
+		if (!g_quiet_start) {
+			fprintf(stderr, "psvr2: device %04x:%04x not found\n", PSVR2_VID, PSVR2_PID);
+		}
 		libusb_exit(g_ctx);
 		g_ctx = NULL;
 		return -1;
 	}
 
+	int config = -1;
+	libusb_get_configuration(g_dev, &config);
+
+	const char *step = "claim status interface";
 	ret = libusb_claim_interface(g_dev, STATUS_INTERFACE);
 	if (ret == 0) {
+		step = "set status alt setting";
 		ret = libusb_set_interface_alt_setting(g_dev, STATUS_INTERFACE, 1);
 	}
 	if (ret == 0) {
+		step = "claim SLAM interface";
 		ret = libusb_claim_interface(g_dev, SLAM_INTERFACE);
 	}
 	if (ret != 0) {
-		fprintf(stderr, "psvr2: failed to claim interfaces: %s\n", libusb_error_name(ret));
+		g_claim_failures++;
+		fprintf(stderr, "psvr2: failed to %s: %s (configuration %d, attempt %d)\n",
+		        step, libusb_error_name(ret), config, g_claim_failures);
 		libusb_close(g_dev);
 		g_dev = NULL;
 		libusb_exit(g_ctx);
 		g_ctx = NULL;
+		/* The device is there but unusable — see reset_thread_fn. Only when
+		 * reconnecting: at a cold launch a claim failure means another
+		 * program holds the headset */
+		if (g_quiet_start) {
+			request_device_reset();
+		}
 		return -1;
 	}
 
+	g_claim_failures = 0;
+	pthread_mutex_lock(&g_lock);
 	g_have_pose = 0;
+	g_imu_head = 0;
+	g_imu_count = 0; /* samples of the previous session are on a dead timeline */
+	pthread_mutex_unlock(&g_lock);
+	g_link_lost = 0;
 	g_running = 1;
 	pthread_create(&g_slam_thread, NULL, slam_thread_fn, NULL);
 	pthread_create(&g_status_thread, NULL, status_thread_fn, NULL);
@@ -388,6 +466,20 @@ void psvr2_stop(void)
 	g_dev = NULL;
 	libusb_exit(g_ctx);
 	g_ctx = NULL;
+}
+
+int psvr2_link_lost(void)
+{
+	return !g_running || g_link_lost;
+}
+
+int psvr2_restart(void)
+{
+	psvr2_stop();
+	g_quiet_start = 1;
+	int ret = psvr2_start();
+	g_quiet_start = 0;
+	return ret;
 }
 
 int psvr2_connected(void)

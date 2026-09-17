@@ -1215,15 +1215,15 @@ final class Renderer: NSObject, MTKViewDelegate {
             if tracker.connected {
                 if trackingLostShown {
                     trackingLostShown = false
-                    overlay?.clearOSD()
+                    overlay?.showOSD("Head tracking restored")
                 }
                 print("[usb] tracking: poses are coming in")
             } else {
-                // Stays until tracking recovers or something else replaces it:
-                // the view is frozen and the user needs to know why. There is
-                // no USB reconnect — an unplugged cable needs a restart
+                // Stays until tracking recovers (AppDelegate.checkUSBLink
+                // reconnects once the cable is back) or something else
+                // replaces it: the view is frozen and the user needs to know why
                 trackingLostShown = true
-                overlay?.showOSD("Head tracking lost — check the headset USB cable (restart if it stays)",
+                overlay?.showOSD("Head tracking lost — check the headset USB cable",
                                  duration: 3600)
                 print("[usb] !!! tracking lost: no SLAM poses (USB unplugged?)")
             }
@@ -1587,6 +1587,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var controlValues: [String: NSTextField] = [:]
     var statusTimer: Timer?
     var sweeper: WindowSweeper?
+    var usbTimer: Timer?
+    private var usbRestarting = false
     let videoURL: URL?
 
     init(videoURL: URL?) {
@@ -1606,11 +1608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print("[usb] !!! Headset not found on USB — rendering without tracking")
             calibration = [-0.09919293, 0, 0.09919293, 0, 1, 0, 1, 0]
         }
-        if calibration[4] == 0 && calibration[6] == 0 {
-            // Old calibration version: k3/k4 not set — identity rotation
-            calibration[4] = 1
-            calibration[6] = 1
-        }
+        Self.fixUpCalibration(&calibration)
 
         // Headset screen
         let vrScreen = Self.findVRScreen()
@@ -1741,6 +1739,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if vrScreen != nil {
             startWindowSweeper(vrScreen: screen)
+            // USB link watchdog: cable unplugged mid-run, or plugged in only
+            // after launch
+            usbTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                self?.checkUSBLink()
+            }
         }
 
         var linkOut: CVDisplayLink?
@@ -1767,6 +1770,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         print("[player] Controls: Space pause · R or headset Fn button — recenter · F projection · G stereo · V flip")
         print("[player]           ←/→ ±15s · ↑/↓ volume · +/- fisheye FOV · Q quit")
         print("[player]           debug: P prediction · [/] lookahead · S scanout · C chromatic")
+    }
+
+    private static func fixUpCalibration(_ calibration: inout [Float]) {
+        if calibration[4] == 0 && calibration[6] == 0 {
+            // Old calibration version: k3/k4 not set — identity rotation
+            calibration[4] = 1
+            calibration[6] = 1
+        }
+    }
+
+    // No live USB session (a read thread died on an error, or the headset
+    // wasn't on USB at launch): retry until the device is back. The restart
+    // blocks on USB calls, so it runs on the control queue, serialized with
+    // the camera calls
+    private func checkUSBLink() {
+        guard !usbRestarting, psvr2_link_lost() == 1, let renderer else { return }
+        usbRestarting = true
+        // The camera stream died with the link: leave camera view (this also
+        // resumes the video it paused)
+        if renderer.passthrough?.active == true {
+            renderer.togglePassthrough()
+        }
+        psvr2ControlQueue.async { [weak self] in
+            let ok = psvr2_restart() == 0
+            var calibration = [Float](repeating: 0, count: 8)
+            let haveCalibration = ok && psvr2_get_distortion_calibration(&calibration) == 0
+            if ok {
+                psvr2_set_brightness(1.0)
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.usbRestarting = false
+                guard ok else { return }
+                print("[usb] PSVR2 reconnected, SLAM tracking restarted")
+                if haveCalibration {
+                    Self.fixUpCalibration(&calibration)
+                    self.renderer.calibration = calibration
+                }
+                self.renderer.proximityEnabled = true
+            }
+        }
     }
 
     // Remote window on the regular monitor: a "setting — value — key" table

@@ -7,6 +7,11 @@
 
 import Metal
 
+// All C-core calls that touch the USB device handle (camera start/stop,
+// session restart) are serialized here; the pose/status getters are
+// thread-safe and don't need it
+let psvr2ControlQueue = DispatchQueue(label: "psvr2.usb-control")
+
 final class PassthroughSource {
     static let width = Int(PSVR2_CAM_WIDTH)
     static let height = Int(PSVR2_CAM_HEIGHT)
@@ -62,11 +67,11 @@ final class PassthroughSource {
 
     var available: Bool { textureL != nil && textureR != nil }
 
-    // Camera USB calls are serialized here. Shutdown joins the read thread
-    // (up to a full transfer timeout) plus a control transfer — on the main
-    // thread that is a visible freeze in the headset, so it runs in the
+    // Camera USB calls go through psvr2ControlQueue. Shutdown joins the read
+    // thread (up to a full transfer timeout) plus a control transfer — on the
+    // main thread that is a visible freeze in the headset, so it runs in the
     // background; start waits for a still-pending shutdown
-    private let usbQueue = DispatchQueue(label: "psvr2.camera")
+    private let usbQueue = psvr2ControlQueue
 
     func start() -> Bool {
         guard available, !active else { return active }

@@ -11,6 +11,16 @@ int psvr2_start(void);
 
 void psvr2_stop(void);
 
+/* 1 — there is no live session: never started, or a read thread died on a
+ * USB error (cable unplugged). */
+int psvr2_link_lost(void);
+
+/* psvr2_stop() + psvr2_start(), for reconnecting after the link is lost;
+ * a missing device is not logged. Like start/stop and the camera calls it
+ * touches the device handle: call all of them from one serial queue (the
+ * getters are safe from any thread). Returns 0 on success. */
+int psvr2_restart(void);
+
 /* 1 — the headset is connected and poses are coming in. Here and in the pose
  * getters below a pose older than 0.5 s counts as invalid: the stream is dead
  * (USB unplugged). */
